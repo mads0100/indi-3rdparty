@@ -65,7 +65,7 @@ OCS::OCS() : INDI::Dome(), WI(this)
     // kill(getpid(), SIGSTOP);
     // Debug only end
 
-    setVersion(1, 2);
+    setVersion(1, 5);
     SetDomeCapability(DOME_CAN_ABORT | DOME_HAS_SHUTTER);
     SlowTimer.callOnTimeout(std::bind(&OCS::SlowTimerHit, this));
 }
@@ -346,7 +346,7 @@ void OCS::GetCapabilites()
         int measurement_error_or_fail = getCommandSingleCharErrorOrLongResponse(PortFD, measurement_reponse,
                                                                                 measurement_command);
         if (measurement_error_or_fail > 1 && strcmp(measurement_reponse, "N/A") != 0 &&
-            strcmp(measurement_reponse, "NAN") != 0 && strcmp(measurement_reponse, "0") != 0) {
+            strcmp(measurement_reponse, "nan") != 0 && strcmp(measurement_reponse, "0") != 0) {
             weather_enabled[measurement] = 1;
         } else {
             weather_enabled[measurement] = 0;
@@ -1403,7 +1403,7 @@ void OCS::SlowTimerHit()
 IPState OCS::updateWeather() {
     if (weather_tab_enabled) {
 
-        LOG_DEBUG("Weathe update called");
+        LOG_DEBUG("Weather update called");
 
         for (int measurement = 0; measurement < WEATHER_MEASUREMENTS_COUNT; measurement ++) {
             if (weather_enabled[measurement] == 1) {
@@ -1563,6 +1563,7 @@ IPState OCS::Park()
     }
     if (sendOCSCommand(OCS_dome_park)) {
         setDomeState(DOME_PARKING);
+        SetParked(true);
         return IPS_BUSY;
     } else {
         setDomeState(DOME_ERROR);
@@ -1583,6 +1584,7 @@ IPState OCS::UnPark()
             ControlShutter(ShutterOperation::SHUTTER_OPEN);
         }
         setDomeState(DOME_UNPARKED);
+        SetParked(false);
         return IPS_OK;
     } else {
         setDomeState(DOME_ERROR);
@@ -1771,6 +1773,7 @@ bool OCS::Connect()
 ************************************************************/
 bool OCS::Disconnect()
 {
+    SlowTimer.stop();
     bool status = INDI::Dome::Disconnect();
     return status;
 }
@@ -2224,7 +2227,7 @@ bool OCS::sendOCSCommand(const char *cmd)
         return false;
     }
 
-    return (response[0] == '0'); //OCS uses 0 for success and non zero for failure, in *most* cases;
+    return (response[0] == '1'); //OCS uses 1 for success and non zero for failure, in *most* cases;
 }
 
 /************************************************************
@@ -2488,12 +2491,17 @@ int OCS::charToInt (char *inString)
  * *****************************************************/
 void OCS::blockUntilClear()
 {
-    // Blocking wait for last command response to clear
+    int maxWaitUs = ((OCSTimeoutSeconds * 1000000) + OCSTimeoutMicroSeconds);
+    int waited = 0;
     while (waitingForResponse) {
-        usleep(((OCSTimeoutSeconds * 1000000) + OCSTimeoutMicroSeconds) / 10);
-//        usleep(OCSTimeoutMicroSeconds / 10);
+        if (!isConnected() || waited > maxWaitUs * 10) {
+            waitingForResponse = false;
+            return;
+        }
+        int slice = maxWaitUs / 10;
+        usleep(slice);
+        waited += slice;
     }
-    // Grab the response waiting command blocker
     waitingForResponse = true;
 }
 

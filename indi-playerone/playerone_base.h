@@ -28,6 +28,9 @@
 #include "indisinglethreadpool.h"
 
 #include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 #include <indiccd.h>
 #include <inditimer.h>
@@ -38,6 +41,11 @@ class POABase : public INDI::CCD
     public:
         POABase();
         ~POABase() override;
+
+        const POACameraProperties &getCameraInfo() const
+        {
+            return mCameraInfo;
+        }
 
         virtual const char *getDefaultName() override;
 
@@ -83,6 +91,11 @@ class POABase : public INDI::CCD
 
     protected:
         INDI::SingleThreadPool mWorker;
+        std::mutex mExposureMutex;
+        std::condition_variable mExposureWakeup;
+        // Target streaming exposure (s), published from the main thread so the
+        // streaming worker thread never touches the STREAMING_EXPOSURE widget directly.
+        std::atomic<double> mStreamExposureS { 0.1 };
         void workerStreamVideo(const std::atomic_bool &isAbortToQuit);
         void workerBlinkExposure(const std::atomic_bool &isAbortToQuit, int blinks, float duration);
         void workerExposure(const std::atomic_bool &isAbortToQuit, float duration);
@@ -136,7 +149,7 @@ class POABase : public INDI::CCD
         POAErrors POAPulseGuideOn(int cameraID, POAConfig dir);
         POAErrors POAPulseGuideOff(int cameraID, POAConfig dir);
         /** Compensete bayer pattern by flip */
-        POAErrors POABayerCompensationByFlip(POAConfig flip, char *dest);
+        POAErrors POABayerCompensationByFlip(POAConfig flip, char *dest, size_t destSize);
 
         /** Additional Properties to INDI::CCD */
         INDI::PropertyNumber  CoolerNP {1};

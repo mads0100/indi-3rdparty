@@ -1,13 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 PROJECT(libapogee C CXX)
 
-set(CMAKE_CXX_STANDARD 11)
-
 option(INDI_INSTALL_UDEV_RULES "Install UDEV rules" On)
 
 LIST(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/")
 LIST(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake_modules/")
 include(GNUInstallDirs)
+include(CMakeCommon)
 
 set(APOGEE_VERSION "3.2")
 set(APOGEE_SOVERSION "3")
@@ -16,7 +15,7 @@ IF(APPLE)
 set(CONF_DIR "/usr/local/lib/indi/DriverSupport/" CACHE STRING "Base configuration directory")
 ELSE(APPLE)
 set(CONF_DIR "/etc" CACHE STRING "Base configuration directory")
-set(UDEVRULES_INSTALL_DIR "/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
+set(UDEVRULES_INSTALL_DIR "/usr/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
 ENDIF()
 
 # IMPORTANT: When update libapogee code to upstream. Do not forget to save apgHelper.cpp as the configuration file

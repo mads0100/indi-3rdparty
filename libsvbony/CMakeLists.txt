@@ -9,6 +9,7 @@ option(INDI_INSTALL_UDEV_RULES "Install UDEV rules" On)
 list (APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/")
 list (APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake_modules/")
 include (GNUInstallDirs)
+include(CMakeCommon)
 include (InstallImported)
 
 add_library (SVBCameraSDK SHARED IMPORTED)
@@ -39,7 +40,7 @@ elseif (UNIX)
 
     # Install udev rules
     if (INDI_INSTALL_UDEV_RULES)
-        set (UDEVRULES_INSTALL_DIR "/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
+        set (UDEVRULES_INSTALL_DIR "/usr/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
         install (FILES 90-svbonyusb.rules DESTINATION ${UDEVRULES_INSTALL_DIR})
     endif()
 

@@ -5,6 +5,7 @@ PROJECT(libfishcamp C CXX)
 LIST(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/")
 LIST(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake_modules/")
 include(GNUInstallDirs)
+include(CMakeCommon)
 find_package(INDI REQUIRED)
 
 option(INDI_INSTALL_UDEV_RULES "Install UDEV rules" On)
@@ -19,8 +20,8 @@ IF(APPLE)
   ## This one is needed for Craft
   include_directories("${CMAKE_INSTALL_PREFIX}/include")
 ELSE(APPLE)
-  set(FIRMWARE_INSTALL_DIR "/lib/firmware" CACHE STRING "libfishcamp firmware installation dir")
-  set(UDEVRULES_INSTALL_DIR "/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
+  set(FIRMWARE_INSTALL_DIR "/usr/lib/firmware" CACHE STRING "libfishcamp firmware installation dir")
+  set(UDEVRULES_INSTALL_DIR "/usr/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
 ENDIF(APPLE)
 #***********************************************************
 find_package(USB1 REQUIRED)
@@ -31,9 +32,6 @@ set(LIBFISHCAMP_VERSION "1.1")
 set(LIBFISHCAMP_SOVERSION "1")
 
 set(fishcamp_LIB_SRCS fishcamp.c)
-
-SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error")
-SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error")
 
 #build a shared library
 ADD_LIBRARY(fishcamp SHARED ${fishcamp_LIB_SRCS})
@@ -52,4 +50,3 @@ IF (INDI_INSTALL_FIRMWARE)
     install(FILES 99-fishcamp.rules DESTINATION ${UDEVRULES_INSTALL_DIR})
   ENDIF()
 ENDIF()
-

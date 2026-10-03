@@ -1,24 +1,23 @@
 #ifndef __omegonprocam_h__
 #define __omegonprocam_h__
 
-/* Version: 57.28200.20250408 */
+/* Version: 60.32226.20260808 */
 /*
    Platform & Architecture:
        (1) Win32:
               (a) x64: Win7 or above
               (b) x86: XP SP3 or above; CPU supports SSE2 instruction set or above
               (c) arm64: Win10 or above
-              (d) arm: Win10 or above
-       (2) WinRT: x64, x86, arm64, arm; Win10 or above
-       (3) macOS:
-              (a) x64+x86: macOS 10.10 or above
-              (b) x64+arm64: macOS 11.0 or above, support x64 and Apple silicon (such as M1, M2, etc)
+       (2) WinRT: x64, x86, arm64; Win10 or above
+       (3) macOS: x64+arm64: macOS 11.0 or above, support x64 and Apple silicon (such as M1, M2, etc)
        (4) Linux: kernel 2.6.27 or above
               (a) x64: GLIBC 2.14 or above
               (b) x86: CPU supports SSE3 instruction set or above; GLIBC 2.8 or above
-              (c) arm64: GLIBC 2.17 or above; built by toolchain aarch64-linux-gnu (version 5.4.0)
-              (d) armhf: GLIBC 2.8 or above; built by toolchain arm-linux-gnueabihf (version 5.4.0)
-              (e) armel: GLIBC 2.8 or above; built by toolchain arm-linux-gnueabi (version 5.4.0)
+              (c) arm64: GLIBC 2.17 or above
+              (d) arm64: musl libc
+              (e) armhf: GLIBC 2.8 or above
+              (f) armel: GLIBC 2.8 or above
+              (g) ostl: STMicroelectronics OpenSTLinux
        (5) Android: __ANDROID_API__ >= 24 (Android 7.0); built by android-ndk-r18b; see https://developer.android.com/ndk/guides/abis
               (a) arm64: arm64-v8a
               (b) arm: armeabi-v7a
@@ -37,10 +36,16 @@
         (b) Camera ID (camId) may change due to connection or system restart. Enumerate the cameras to get the camera ID, and then call the Open function to pass in the camId parameter to open the camera.
 */
 
-#if defined(_WIN32)
-#ifndef _INC_WINDOWS
+/*
+    Coordinate:
+        (a) Functions with coordinate parameters, such as Omegonprocam_put_Roi, Omegonprocam_put_AEAuxRect, etc., the coordinate is always relative to the original resolution,
+            even that the image has been flipped, rotated, digital binning, ROI, or combination of the previous operations.
+        (b) Exception: if the image is upside down (see here), the coordinate must be also upsize down.
+        (c) Exception: hardware binning.
+*/
+
+#if defined(_WIN32) && (!defined(_INC_WINDOWS))
 #include <windows.h>
-#endif
 #endif
 
 #ifdef __cplusplus
@@ -61,13 +66,17 @@ extern "C" {
 #pragma pack(push, 8)
 #ifdef OMEGONPROCAM_EXPORTS
 #define OMEGONPROCAM_API(x)    __declspec(dllexport)   x   __stdcall  /* in Windows, we use __stdcall calling convention, see https://docs.microsoft.com/en-us/cpp/cpp/stdcall */
+#define OMEGONPROCAM_APIV(x)   __declspec(dllexport)   x   __cdecl
 #elif !defined(OMEGONPROCAM_NOIMPORTS)
 #define OMEGONPROCAM_API(x)    __declspec(dllimport)   x   __stdcall
+#define OMEGONPROCAM_APIV(x)   __declspec(dllimport)   x   __cdecl
 #else
 #define OMEGONPROCAM_API(x)    x   __stdcall
+#define OMEGONPROCAM_APIV(x)   x   __cdecl
 #endif
 #else   /* Linux or macOS */
 #define OMEGONPROCAM_API(x)    x
+#define OMEGONPROCAM_APIV(x)   x
 #if (!defined(HRESULT)) && (!defined(__COREFOUNDATION_CFPLUGINCOM__)) /* CFPlugInCOM.h */
 #define HRESULT int
 #endif
@@ -103,24 +112,25 @@ extern "C" {
 #define E_UNEXPECTED        (HRESULT)(0x8000ffff) /* Catastrophic failure */ /* Remark: Generally indicates that the conditions are not met, such as calling put_Option setting some options that do not support modification when the camera is running, and so on */
 #define E_NOTIMPL           (HRESULT)(0x80004001) /* Not supported or not implemented */ /* Remark: This feature is not supported on this model of camera */
 #define E_NOINTERFACE       (HRESULT)(0x80004002)
-#define E_ACCESSDENIED      (HRESULT)(0x80070005) /* Permission denied */ /* Remark: The program on Linux does not have permission to open the USB device, please enable udev rules file or run as root */
+#define E_ACCESSDENIED      (HRESULT)(0x80070005) /* Permission denied */ /* Remark: Insufficient permissions. This may be blocked by system security policies; on Linux, USB devices often require additional permission configuration, which can be resolved by setting up udev rules or running with root privileges */
 #define E_OUTOFMEMORY       (HRESULT)(0x8007000e) /* Out of memory */
 #define E_INVALIDARG        (HRESULT)(0x80070057) /* One or more arguments are not valid */
 #define E_POINTER           (HRESULT)(0x80004003) /* Pointer that is not valid */ /* Remark: Pointer is NULL */
 #define E_FAIL              (HRESULT)(0x80004005) /* Generic failure */
 #define E_WRONG_THREAD      (HRESULT)(0x8001010e) /* Call function in the wrong thread */
-#define E_GEN_FAILURE       (HRESULT)(0x8007001f) /* Device not functioning */ /* Remark: It is generally caused by hardware errors, such as cable problems, USB port problems, poor contact, camera hardware damage, etc */
+#define E_GEN_FAILURE       (HRESULT)(0x8007001f) /* Device not functioning */ /* Remark: It is generally caused by hardware errors, such as cable problems, USB port problems, poor contact, insufficient power supply, camera hardware damage, etc */
 #define E_BUSY              (HRESULT)(0x800700aa) /* The requested resource is in use */ /* Remark: The camera is already in use, such as duplicated opening/starting the camera, or being used by other application, etc */
 #define E_PENDING           (HRESULT)(0x8000000a) /* The data necessary to complete this operation is not yet available */ /* Remark: No data is available at this time */
 #define E_TIMEOUT           (HRESULT)(0x8001011f) /* This operation returned because the timeout period expired */
-#define E_UNREACH           (HRESULT)(0x80072743) /* Network is unreachable */
+#define E_UNREACH           (HRESULT)(0x80072743) /* Network is unreachable */ /* Remark: Please check the IP settings of the camera and the computer, or the firewall settings */
+#define E_CANCELLED         (HRESULT)(0x800704C7) /* The operation was canceled by the user */
 #endif
 
 /* handle */
 typedef struct Omegonprocam_t { int unused; } *HOmegonprocam;
 
 #define OMEGONPROCAM_MAX                       128
-                                         
+
 #define OMEGONPROCAM_FLAG_CMOS                 0x00000001  /* cmos sensor */
 #define OMEGONPROCAM_FLAG_CCD_PROGRESSIVE      0x00000002  /* progressive ccd sensor */
 #define OMEGONPROCAM_FLAG_CCD_INTERLACED       0x00000004  /* interlaced ccd sensor */
@@ -169,7 +179,7 @@ typedef struct Omegonprocam_t { int unused; } *HOmegonprocam;
 #define OMEGONPROCAM_FLAG_GIGE                 0x0000200000000000  /* 1 Gigabit GigE */
 #define OMEGONPROCAM_FLAG_10GIGE               0x0000400000000000  /* 10 Gigabit GigE */
 #define OMEGONPROCAM_FLAG_5GIGE                0x0000800000000000  /* 5 Gigabit GigE */
-#define OMEGONPROCAM_FLAG_25GIGE               0x0001000000000000  /* 2.5 Gigabit GigE */
+#define OMEGONPROCAM_FLAG_40GIGE               0x0001000000000000  /* 40 Gigabit GigE */
 #define OMEGONPROCAM_FLAG_AUTOFOCUSER          0x0002000000000000  /* astro auto focuser */
 #define OMEGONPROCAM_FLAG_LIGHT_SOURCE         0x0004000000000000  /* stand alone light source */
 #define OMEGONPROCAM_FLAG_CAMERALINK           0x0008000000000000  /* camera link */
@@ -178,6 +188,12 @@ typedef struct Omegonprocam_t { int unused; } *HOmegonprocam;
 #define OMEGONPROCAM_FLAG_SELFTRIGGER          0x0040000000000000  /* self trigger */
 #define OMEGONPROCAM_FLAG_RAW11                0x0080000000000000  /* pixel format, RAW 11bits */
 #define OMEGONPROCAM_FLAG_GHOPTO               0x0100000000000000  /* ghopto sensor */
+#define OMEGONPROCAM_FLAG_RAW10PACK            0x0200000000000000  /* pixel format, RAW 10bits packed */
+#define OMEGONPROCAM_FLAG_USB32                0x0400000000000000  /* USB 3.2 Gen 2 */
+#define OMEGONPROCAM_FLAG_USB32_OVER_USB30     0x0800000000000000  /* USB 3.2 Gen 2 camera connected to usb3.0 port */
+#define OMEGONPROCAM_FLAG_LINESCAN             0x1000000000000000  /* line scan camera */
+#define OMEGONPROCAM_FLAG_25GIGE               0x2000000000000000  /* 2.5 Gigabit GigE */
+#define OMEGONPROCAM_FLAG_RAW14PACK            0x4000000000000000  /* pixel format, RAW 14bits packed */
 
 #define OMEGONPROCAM_EXPOGAIN_DEF              100     /* exposure gain, default value */
 #define OMEGONPROCAM_EXPOGAIN_MIN              100     /* exposure gain, minimum value */
@@ -243,7 +259,7 @@ typedef struct Omegonprocam_t { int unused; } *HOmegonprocam;
 #define OMEGONPROCAM_HEARTBEAT_MAX             10000   /* millisecond */
 #define OMEGONPROCAM_AE_PERCENT_MIN            0       /* auto exposure percent; 0 or 100 => full roi average, means "disabled" */
 #define OMEGONPROCAM_AE_PERCENT_MAX            100
-#define OMEGONPROCAM_AE_PERCENT_DEF            10      /* auto exposure percent: enabled, percentage = 10% */
+#define OMEGONPROCAM_AE_PERCENT_DEF            1       /* auto exposure percent: enabled, percentage = 1% */
 #define OMEGONPROCAM_NOPACKET_TIMEOUT_MIN      500     /* no packet timeout minimum: 500ms */
 #define OMEGONPROCAM_NOFRAME_TIMEOUT_MIN       500     /* no frame timeout minimum: 500ms */
 #define OMEGONPROCAM_DYNAMIC_DEFECT_T1_MIN     0       /* dynamic defect pixel correction, dead pixel ratio: the smaller the dead ratio is, the more stringent the conditions for processing dead pixels are, and fewer pixels will be processed */
@@ -259,7 +275,25 @@ typedef struct Omegonprocam_t { int unused; } *HOmegonprocam;
 #define OMEGONPROCAM_HDR_THRESHOLD_MIN         0
 #define OMEGONPROCAM_HDR_THRESHOLD_MAX         4094
 #define OMEGONPROCAM_CDS_MIN                   0       /* Correlated Double Sampling */
-#define OMEGONPROCAM_CDS_MAX                   100
+#define OMEGONPROCAM_ANTIBLOOMING_MIN          0       /* Anti Blooming */
+#define OMEGONPROCAM_GVCP_RETRY_DEF            4       /* GVCP Retry */
+#define OMEGONPROCAM_GVCP_RETRY_MIN            2
+#define OMEGONPROCAM_GVCP_RETRY_MAX            20
+#define OMEGONPROCAM_GVCP_TIMEOUT_DEF          40      /* GVCP Timeout */
+#define OMEGONPROCAM_GVCP_TIMEOUT_MIN          20
+#define OMEGONPROCAM_GVCP_TIMEOUT_MAX          200
+#define OMEGONPROCAM_GVSP_WAIT_PERCENT_DEF     1       /* GVSP wait percent */
+#define OMEGONPROCAM_GVSP_WAIT_PERCENT_MIN     0
+#define OMEGONPROCAM_GVSP_WAIT_PERCENT_MAX     100
+#define OMEGONPROCAM_FRONTEND_MAX              1024    /* frontend frame buffer deque length */
+#define OMEGONPROCAM_FRONTEND_DEF              4
+#define OMEGONPROCAM_FRONTEND_MIN              2
+#define OMEGONPROCAM_BACKEND_MAX               1024    /* backend frame buffer deque length */
+#define OMEGONPROCAM_BACKEND_DEF               3
+#define OMEGONPROCAM_BACKEND_MIN               2
+#define OMEGONPROCAM_HEAT_MIN                  0       /* Heat */
+#define OMEGONPROCAM_LANE_MIN                  0       /* Lane */
+#define OMEGONPROCAM_FAN_MIN                   0       /* Fan */
 
 typedef struct {
     unsigned    width;
@@ -294,11 +328,11 @@ typedef struct {
     char                  displayname[64];    /* display name: model name or user-defined name (if any and Omegonprocam_EnumWithName) */
     char                  id[64];             /* unique and opaque id of a connected camera, for Omegonprocam_Open */
 #endif
-    const OmegonprocamModelV2* model;
+    const OmegonprocamModelV2* model;              /* Functionally equivalent to a global constant, remaining valid and unchanged throughout the lifetime of the process */
 } OmegonprocamDeviceV2; /* device instance for enumerating */
 
 /*
-    get the version of this dll/so/dylib, which is: 57.28200.20250408
+    get the version of this dll/so/dylib, which is: 60.32226.20260808
 */
 #if defined(_WIN32)
 OMEGONPROCAM_API(const wchar_t*)   Omegonprocam_Version();
@@ -321,14 +355,12 @@ OMEGONPROCAM_API(unsigned) Omegonprocam_EnumV2(OmegonprocamDeviceV2 arr[OMEGONPR
 
 /* use the camId of OmegonprocamDeviceV2, which is enumerated by Omegonprocam_EnumV2.
     if camId is NULL, Omegonprocam_Open will open the first enumerated camera.
-    If it is a GigE camera, the camId can also be specified as (case sensitive):
-        (a) "ip:xxx.xxx.xxx.xxx" (such as ip:192.168.1.100) or
-        (b) "mac:xxxxxxxxxxxx" (such as mac:d05f64ffff23) or
-        (c) "sn:xxxxxxxxxxxx" (such as sn:d05f64ffff23) or
-        (d) "name:xxxxxx" (such as name: Camera1)
-    If it is a PCIe camera, the camId can the camId can also be specified as (case sensitive):
-        (a) "sn:xxxxxxxxxxxx" (such as sn:ZP250212241204105)
-        (b) "name:xxxxxx" (such as name: Camera1)
+    For USB, GigE, CameraLink or CXP camera, the camId can also be specified as (case sensitive, no spaces):
+        (a) "sn:xxxxxxxxxxxx" (Use SN, such as sn:ZP250212241204105), or
+        (b) "name:xxxxxx" (Use user-defined name, such as name:Camera1)
+    Moreover, for GigE camera, the camId can also be specified as (case sensitive, no spaces):
+        (a) "ip:xxx.xxx.xxx.xxx" (Use IP address, such as ip:192.168.1.100), or
+        (b) "mac:xxxxxxxxxxxx" (Use MAC address, such as mac:d05f64ffff23)
     For the issue of opening the camera on Android, please refer to the documentation
 */
 #if defined(_WIN32)
@@ -348,6 +380,18 @@ OMEGONPROCAM_API(HOmegonprocam) Omegonprocam_OpenByIndex(unsigned index);
 /* close the handle. After it is closed, never use the handle any more. */
 OMEGONPROCAM_API(void)     Omegonprocam_Close(HOmegonprocam h);
 
+/* load cfg:
+     (1) nullptr or empty string, load from EEPROM (address = 0)
+     (2) eeprom=???, load from EEPROM (address = 0x???)
+     (3) path\to\file.ini, load from ini file
+     (4) path\to\file.json, load from json file
+*/
+#if defined(_WIN32)
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_Load(HOmegonprocam h, const wchar_t* strPara);
+#else
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_Load(HOmegonprocam h, const char* strPara);
+#endif
+
 #define OMEGONPROCAM_EVENT_EXPOSURE          0x0001    /* exposure time or gain changed */
 #define OMEGONPROCAM_EVENT_TEMPTINT          0x0002    /* white balance changed, Temp/Tint mode */
 #define OMEGONPROCAM_EVENT_IMAGE             0x0004    /* live image arrived, use Omegonprocam_PullImageXXXX to get this image */
@@ -362,6 +406,8 @@ OMEGONPROCAM_API(void)     Omegonprocam_Close(HOmegonprocam h);
 #define OMEGONPROCAM_EVENT_AUTOEXPO_CONV     0x000d    /* auto exposure convergence */
 #define OMEGONPROCAM_EVENT_AUTOEXPO_CONVFAIL 0x000e    /* auto exposure once mode convergence failed */
 #define OMEGONPROCAM_EVENT_FPNC              0x000f    /* fix pattern noise correction status changed */
+#define OMEGONPROCAM_EVENT_FRONT_OVERFLOW    0x0010    /* front buffer overflow */
+#define OMEGONPROCAM_EVENT_BACK_OVERFLOW     0x0011    /* back buffer overflow */
 #define OMEGONPROCAM_EVENT_ERROR             0x0080    /* generic error */
 #define OMEGONPROCAM_EVENT_DISCONNECTED      0x0081    /* camera disconnected */
 #define OMEGONPROCAM_EVENT_NOFRAMETIMEOUT    0x0082    /* no frame timeout error */
@@ -375,7 +421,7 @@ OMEGONPROCAM_API(void)     Omegonprocam_Close(HOmegonprocam h);
 #define OMEGONPROCAM_EVENT_FACTORY           0x8001    /* restore factory settings */
 
 #if defined(_WIN32)
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_StartPullModeWithWndMsg(HOmegonprocam h, HWND hWnd, UINT nMsg);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_StartPullModeWithWndMsg(HOmegonprocam h, HWND hWnd, unsigned msgWnd);
 #endif
 
 /* Do NOT call Omegonprocam_Close, Omegonprocam_Stop in this callback context, it deadlocks. */
@@ -428,9 +474,42 @@ typedef struct {
     OmegonprocamGps gps;
 } OmegonprocamFrameInfoV4;
 
+typedef struct {
+    unsigned id;                    /* 0 is reserved as an invalid id */
+    unsigned char pixelFormat;      /* OMEGONPROCAM_PIXELFORMAT_xxxx */
+    unsigned char ergb;             /* see OMEGONPROCAM_OPTION_RGB */
+    unsigned char snapR;            /* see Omegonprocam_SnapR */
+    unsigned char infoVer;          /* OmegonprocamFrameInfo version >= 4 */
+    unsigned reserved;
+    unsigned strideRaw;             /* stride of RAW, 0 means = image width (no padding) */
+    OmegonprocamFrameInfoV4* ptrInfo;
+    void* snapCtx;
+    void* ptrRaw;                   /* RAW, see OMEGONPROCAM_OPTION_IMAGEPTRRAW */
+    unsigned char* ptr8;
+    unsigned short* ptr16;
+} OmegonprocamImagePtr;
+
+/* Obtains a pointer to the frame buffer directly from the SDK, eliminating the need to copy frame data and thus improving performance */
+/* bStill: to pull still image, set to 1, otherwise 0 */
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_PullImagePtr(HOmegonprocam h, int bStill, OmegonprocamImagePtr* ptrImage);
+
+/* After a frame buffer has been used, it must be returned to the SDK for reuse. Please note the following:
+    (a) The frame buffer must only be returned back after it is no longer in use. Any access after returning it is unsafe, as the SDK may have already reused the buffer and overwritten the memory with new data.
+    (b) If a frame buffer is not returned, the pool of available buffers will gradually decrease.
+    (c) Each frame buffer obtained via Pull (identified by its ID) may be returned only once; duplicate returns are not allowed.
+    (d) The return order does not need to match the Pull order; buffers may be returned out of order.
+    (e) Frame buffers that have not been returned remain valid after Omegonprocam_Stop. Frame buffers that have not been returned become invalid immediately after Omegonprocam_Close.
+*/
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_PushImagePtr(HOmegonprocam h, unsigned ptrId);
+
+/* waitMS: The timeout interval, in milliseconds. If a nonzero value is specified, the function waits until the image is ok or the interval elapses.
+            If waitMS is zero, the function does not enter a wait state if the image is not available; it always returns immediately; this is equal to Omegonprocam_PullImagePtr.
+*/
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_WaitImagePtr(HOmegonprocam h, unsigned waitMS, int bStill, OmegonprocamImagePtr* ptrImage);
+
 /*
-    nWaitMS: The timeout interval, in milliseconds. If a nonzero value is specified, the function waits until the image is ok or the interval elapses.
-             If nWaitMS is zero, the function does not enter a wait state if the image is not available; it always returns immediately; this is equal to Omegonprocam_PullImageV4.
+    waitMS: The timeout interval, in milliseconds. If a nonzero value is specified, the function waits until the image is ok or the interval elapses.
+             If waitMS is zero, the function does not enter a wait state if the image is not available; it always returns immediately; this is equal to Omegonprocam_PullImageV4.
     bStill: to pull still image, set to 1, otherwise 0
     bits: 24 (RGB24), 32 (RGB32), 48 (RGB48), 8 (Grey), 16 (Grey), 64 (RGB64).
           In RAW mode, this parameter is ignored.
@@ -471,9 +550,9 @@ typedef struct {
             |-----------|------------------------|-------------------------------|-----------------------|
 */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_PullImageV4(HOmegonprocam h, void* pImageData, int bStill, int bits, int rowPitch, OmegonprocamFrameInfoV4* pInfo);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_WaitImageV4(HOmegonprocam h, unsigned nWaitMS, void* pImageData, int bStill, int bits, int rowPitch, OmegonprocamFrameInfoV4* pInfo);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_WaitImageV4(HOmegonprocam h, unsigned waitMS, void* pImageData, int bStill, int bits, int rowPitch, OmegonprocamFrameInfoV4* pInfo);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_PullImageV3(HOmegonprocam h, void* pImageData, int bStill, int bits, int rowPitch, OmegonprocamFrameInfoV3* pInfo);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_WaitImageV3(HOmegonprocam h, unsigned nWaitMS, void* pImageData, int bStill, int bits, int rowPitch, OmegonprocamFrameInfoV3* pInfo);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_WaitImageV3(HOmegonprocam h, unsigned waitMS, void* pImageData, int bStill, int bits, int rowPitch, OmegonprocamFrameInfoV3* pInfo);
 
 typedef struct {
     unsigned            width;
@@ -517,6 +596,8 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_Pause(HOmegonprocam h, int bPause); /* 1
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_Snap(HOmegonprocam h, unsigned nResolutionIndex);  /* still image snap */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_SnapN(HOmegonprocam h, unsigned nResolutionIndex, unsigned nNumber);  /* multiple still image snap */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_SnapR(HOmegonprocam h, unsigned nResolutionIndex, unsigned nNumber);  /* multiple RAW still image snap */
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_SnapV2(HOmegonprocam h, unsigned nResolutionIndex, unsigned nNumber, int eRGB, void* snapCtx);
+
 /*
     soft trigger:
     nNumber:    0xffff:     trigger continuously
@@ -527,12 +608,12 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_Trigger(HOmegonprocam h, unsigned short 
 
 /*
     trigger synchronously
-    nWaitMS:    0:              by default, exposure * 102% + 4000 milliseconds
+    waitMS:     0:              by default, exposure * 102% + 4000 milliseconds
                 0xffffffff:     wait infinite
                 other:          milliseconds to wait
 */
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_TriggerSyncV4(HOmegonprocam h, unsigned nWaitMS, void* pImageData, int bits, int rowPitch, OmegonprocamFrameInfoV4* pInfo);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_TriggerSync(HOmegonprocam h, unsigned nWaitMS, void* pImageData, int bits, int rowPitch, OmegonprocamFrameInfoV3* pInfo);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_TriggerSyncV4(HOmegonprocam h, unsigned waitMS, void* pImageData, int bits, int rowPitch, OmegonprocamFrameInfoV4* pInfo);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_TriggerSync(HOmegonprocam h, unsigned waitMS, void* pImageData, int bits, int rowPitch, OmegonprocamFrameInfoV3* pInfo);
 
 /*
     put_Size, put_eSize, can be used to set the video output resolution BEFORE Omegonprocam_StartXXXX.
@@ -621,13 +702,13 @@ typedef void (__stdcall* PIOMEGONPROCAM_PROGRESS)(int percent, void* ctxProgress
 typedef void (__stdcall* PIOMEGONPROCAM_HISTOGRAM_CALLBACKV2)(const unsigned* aHist, unsigned nFlag, void* ctxHistogramV2);
 
 /*
-* bAutoExposure:
+* mode:
 *   0: disable auto exposure
-*   1: auto exposure continue mode
-*   2: auto exposure once mode
+*   1: auto exposure continuous mode
+*   2: auto exposure once
 */
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_AutoExpoEnable(HOmegonprocam h, int* bAutoExposure);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_AutoExpoEnable(HOmegonprocam h, int bAutoExposure);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_AutoExpoEnable(HOmegonprocam h, int* mode);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_AutoExpoEnable(HOmegonprocam h, int mode);
 
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_AutoExpoTarget(HOmegonprocam h, unsigned short* Target);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_AutoExpoTarget(HOmegonprocam h, unsigned short Target);
@@ -677,6 +758,7 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_FfcImport(HOmegonprocam h, const wchar_t
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_FfcExport(HOmegonprocam h, const char* filePath);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_FfcImport(HOmegonprocam h, const char* filePath);
 #endif
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_FfcFile(const void* data[], unsigned num, unsigned width, unsigned height, unsigned fourcc, unsigned bits, const char* outfile);
 
 /* Dark Field Correction */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_DfcOnce(HOmegonprocam h);
@@ -730,7 +812,7 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_FanMaxSpeed(HOmegonprocam h); /* get
 
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_MaxBitDepth(HOmegonprocam h); /* get the max bitdepth of this camera, such as 8, 10, 12, 14, 16 */
 
-/* power supply of lighting:
+/* Light Frequency:
         0 => 60HZ AC
         1 => 50Hz AC
         2 => DC
@@ -753,6 +835,7 @@ typedef struct {
 #endif
 #endif
 
+/* Minimum width & height: 4 */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_AWBAuxRect(HOmegonprocam h, const RECT* pAuxRect); /* auto white balance ROI */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_AWBAuxRect(HOmegonprocam h, RECT* pAuxRect);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_AEAuxRect(HOmegonprocam h, const RECT* pAuxRect);  /* auto exposure ROI */
@@ -770,13 +853,14 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_MonoMode(HOmegonprocam h);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_StillResolutionNumber(HOmegonprocam h);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_StillResolution(HOmegonprocam h, unsigned nResolutionIndex, int* pWidth, int* pHeight);
 
-/*  0: no realtime
+/*  0: Off
           stop grab frame when frame buffer deque is full, until the frames in the queue are pulled away and the queue is not full
-    1: realtime
+    1: Both
           use minimum frame buffer. When new frame arrive, drop all the pending frame regardless of whether the frame buffer is full.
           If DDR present, also limit the DDR frame buffer to only one frame.
-    2: soft realtime
-          Drop the oldest frame when the queue is full and then enqueue the new frame
+    2: Soft
+          use minimum frame buffer. When new frame arrive, drop all the pending frame regardless of whether the frame buffer is full.
+          If DDR present, the DDR frame buffer unchanged.
     default: 0
 */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_RealTime(HOmegonprocam h, int val);
@@ -868,164 +952,190 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_read_Pipe(HOmegonprocam h, unsigned pipe
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_write_Pipe(HOmegonprocam h, unsigned pipeId, const void* pBuffer, unsigned nBufferLen);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_feed_Pipe(HOmegonprocam h, unsigned pipeId);
 
-#define OMEGONPROCAM_OPTION_NOFRAME_TIMEOUT        0x01       /* no frame timeout: 0 => disable, positive value (>= OMEGONPROCAM_NOFRAME_TIMEOUT_MIN) => timeout milliseconds. default: disable */
-#define OMEGONPROCAM_OPTION_THREAD_PRIORITY        0x02       /* set the priority of the internal thread which grab data from the usb device.
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Option(HOmegonprocam h, unsigned iOption, int iValue);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Option(HOmegonprocam h, unsigned iOption, int* piValue);
+
+/* Case insensitive */
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Int(HOmegonprocam h, const char* strName, int iValue);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Int(HOmegonprocam h, const char* strName, int* piValue);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Str(HOmegonprocam h, const char* strName, const char* strValue);
+/* strValue: output buffer (128 bytes are always sufficient) */
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Str(HOmegonprocam h, const char* strName, char strValue[]);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Enum(HOmegonprocam h, const char* strName, int* pNumber, int arrValue[], const char* arrString[]);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_StrPtr(HOmegonprocam h, const char* strName, const char** strValue);
+
+/* [RW] = Read/Write; [RO] = Read Only; [WO] = Write Only */
+#define OMEGONPROCAM_OPTION_NOFRAME_TIMEOUT        0x01       /* [RW] no frame timeout: 0 => disable, positive value (>= OMEGONPROCAM_NOFRAME_TIMEOUT_MIN) => timeout milliseconds. default: disable */
+#define OMEGONPROCAM_OPTION_THREAD_PRIORITY        0x02       /* [RW] set the priority of the internal thread which grab data from the usb device.
                                                              Win: iValue: 0 => THREAD_PRIORITY_NORMAL; 1 => THREAD_PRIORITY_ABOVE_NORMAL; 2 => THREAD_PRIORITY_HIGHEST; 3 => THREAD_PRIORITY_TIME_CRITICAL; default: 1; see: https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority
-                                                             Linux & macOS: The high 16 bits for the scheduling policy, and the low 16 bits for the priority; see: https://linux.die.net/man/3/pthread_setschedparam
+                                                             Linux & macOS: similar to Win
                                                          */
-#define OMEGONPROCAM_OPTION_PROCESSMODE            0x03       /* obsolete & useless, noop. 0 = better image quality, more cpu usage. this is the default value; 1 = lower image quality, less cpu usage */
-#define OMEGONPROCAM_OPTION_RAW                    0x04       /* raw data mode, read the sensor "raw" data. This can be set only while camea is NOT running. 0 = rgb, 1 = raw, default value: 0 */
-#define OMEGONPROCAM_OPTION_HISTOGRAM              0x05       /* 0 = only one, 1 = continue mode */
-#define OMEGONPROCAM_OPTION_BITDEPTH               0x06       /* 0 = 8 bits mode, 1 = 16 bits mode, subset of OMEGONPROCAM_OPTION_PIXEL_FORMAT */
-#define OMEGONPROCAM_OPTION_FAN                    0x07       /* 0 = turn off the cooling fan, [1, max] = fan speed, , set to "-1" means to use default fan speed */
-#define OMEGONPROCAM_OPTION_TEC                    0x08       /* 0 = turn off the thermoelectric cooler, 1 = turn on the thermoelectric cooler */
-#define OMEGONPROCAM_OPTION_LINEAR                 0x09       /* 0 = turn off the builtin linear tone mapping, 1 = turn on the builtin linear tone mapping, default value: 1 */
-#define OMEGONPROCAM_OPTION_CURVE                  0x0a       /* 0 = turn off the builtin curve tone mapping, 1 = turn on the builtin polynomial curve tone mapping, 2 = logarithmic curve tone mapping, default value: 2 */
-#define OMEGONPROCAM_OPTION_TRIGGER                0x0b       /* 0 = video mode, 1 = software or simulated trigger mode, 2 = external trigger mode, 3 = external + software trigger, 4 = self trigger, default value = 0 */
-#define OMEGONPROCAM_OPTION_RGB                    0x0c       /* 0 => RGB24; 1 => enable RGB48 format when bitdepth > 8; 2 => RGB32; 3 => 8 Bits Grey (only for mono camera); 4 => 16 Bits Grey (only for mono camera when bitdepth > 8); 5 => 64(RGB64) */
-#define OMEGONPROCAM_OPTION_COLORMATIX             0x0d       /* enable or disable the builtin color matrix, default value: 1 */
-#define OMEGONPROCAM_OPTION_WBGAIN                 0x0e       /* enable or disable the builtin white balance gain, default value: 1 */
-#define OMEGONPROCAM_OPTION_TECTARGET              0x0f       /* get or set the target temperature of the thermoelectric cooler, in 0.1 degree Celsius. For example, 125 means 12.5 degree Celsius, -35 means -3.5 degree Celsius. Set "-2730" or below means using the default for that model */
-#define OMEGONPROCAM_OPTION_AUTOEXP_POLICY         0x10       /* auto exposure policy:
+#define OMEGONPROCAM_OPTION_PROCESSMODE            0x03       /* [RW] obsolete & useless, noop. 0 = better image quality, more cpu usage. this is the default value; 1 = lower image quality, less cpu usage */
+#define OMEGONPROCAM_OPTION_RAW                    0x04       /* [RW]
+                                                            0: RGB mode
+                                                            1: RAW mode, read the CMOS or CCD raw data
+                                                            -1: RAW mode, the difference from 1 is the execution of FFC, DFC, FPNC, black balance, and white balance
+                                                            default value: 0
+                                                         */
+#define OMEGONPROCAM_OPTION_HISTOGRAM              0x05       /* [RW] 0 = only one, 1 = continue mode */
+#define OMEGONPROCAM_OPTION_BITDEPTH               0x06       /* [RW] 0 = 8 bits mode, 1 = 16 bits mode, subset of OMEGONPROCAM_OPTION_PIXEL_FORMAT */
+#define OMEGONPROCAM_OPTION_FAN                    0x07       /* [RW] 0 = turn off the cooling fan, [1, max] = fan speed, set to "-1" means to use default fan speed */
+#define OMEGONPROCAM_OPTION_TEC                    0x08       /* [RW] 0 = turn off the thermoelectric cooler, 1 = turn on the thermoelectric cooler */
+#define OMEGONPROCAM_OPTION_LINEAR                 0x09       /* [RW] 0 = turn off the builtin linear tone mapping, 1 = turn on the builtin linear tone mapping, default value: 1 */
+#define OMEGONPROCAM_OPTION_CURVE                  0x0a       /* [RW] 0 = turn off the builtin curve tone mapping, 1 = turn on the builtin polynomial curve tone mapping, 2 = logarithmic curve tone mapping, default value: 2 */
+#define OMEGONPROCAM_OPTION_TRIGGER                0x0b       /* [RW] 0 = video mode, 1 = software or simulated trigger mode, 2 = external trigger mode, 3 = external + software trigger, 4 = self trigger, default value = 0 */
+#define OMEGONPROCAM_OPTION_RGB                    0x0c       /* [RW] 0 => RGB24; 1 => enable RGB48 format when bitdepth > 8; 2 => RGB32; 3 => 8 Bits Grey (only for mono camera); 4 => 16 Bits Grey (only for mono camera when bitdepth > 8); 5 => 64(RGB64) */
+#define OMEGONPROCAM_OPTION_COLORMATIX             0x0d       /* [RW] enable or disable the builtin color matrix, default value: 1 */
+#define OMEGONPROCAM_OPTION_WBGAIN                 0x0e       /* [RW] enable or disable the builtin white balance gain, default value: 1 */
+#define OMEGONPROCAM_OPTION_TECTARGET              0x0f       /* [RW] get or set the target temperature of the thermoelectric cooler, in 0.1 degree Celsius. For example, 125 means 12.5 degree Celsius, -35 means -3.5 degree Celsius. Set "-2730" or below means using the default for that model */
+#define OMEGONPROCAM_OPTION_AUTOEXP_POLICY         0x10       /* [RW] auto exposure policy:
                                                              0: Exposure Only
                                                              1: Exposure Preferred
                                                              2: Gain Only
                                                              3: Gain Preferred
                                                              default value: 1
                                                          */
-#define OMEGONPROCAM_OPTION_FRAMERATE              0x11       /* limit the frame rate, the default value 0 means no limit */
-#define OMEGONPROCAM_OPTION_DEMOSAIC               0x12       /* demosaic method for both video and still image: BILINEAR = 0, VNG(Variable Number of Gradients) = 1, PPG(Patterned Pixel Grouping) = 2, AHD(Adaptive Homogeneity Directed) = 3, EA(Edge Aware) = 4, see https://en.wikipedia.org/wiki/Demosaicing
+#define OMEGONPROCAM_OPTION_FRAMERATE              0x11       /* [RW] limit the frame rate, the default value 0 means no limit */
+#define OMEGONPROCAM_OPTION_DEMOSAIC               0x12       /* [RW] demosaic method for both video and still image: BILINEAR = 0, VNG(Variable Number of Gradients) = 1, PPG(Patterned Pixel Grouping) = 2, AHD(Adaptive Homogeneity Directed) = 3, EA(Edge Aware) = 4, see https://en.wikipedia.org/wiki/Demosaicing
                                                               In terms of CPU usage, EA is the lowest, followed by BILINEAR, and the others are higher.
                                                               default value: 0
                                                          */
-#define OMEGONPROCAM_OPTION_DEMOSAIC_VIDEO         0x13       /* demosaic method for video */
-#define OMEGONPROCAM_OPTION_DEMOSAIC_STILL         0x14       /* demosaic method for still image */
-#define OMEGONPROCAM_OPTION_BLACKLEVEL             0x15       /* black level */
-#define OMEGONPROCAM_OPTION_MULTITHREAD            0x16       /* multithread image processing */
-#define OMEGONPROCAM_OPTION_BINNING                0x17       /* binning
+#define OMEGONPROCAM_OPTION_DEMOSAIC_VIDEO         0x13       /* [RW] demosaic method for video */
+#define OMEGONPROCAM_OPTION_DEMOSAIC_STILL         0x14       /* [RW] demosaic method for still image */
+#define OMEGONPROCAM_OPTION_BLACKLEVEL             0x15       /* [RW] the black level refers to the baseline signal value output by an image sensor under no-light (completely dark) conditions.
+                                                              In digital imaging systems, a fixed voltage offset is intentionally added to the signal to ensure that dark-region signals remain above zero, thereby preventing the loss of faint shadow details during A/D conversion.
+                                                                  (a) Prevent clipping: The sensor circuit's intrinsic noise may occasionally produce negative values. Without an offset, these negative values would be forcibly clipped to zero, resulting in the loss of shadow details.
+                                                                  (b) Preserve linearity: Raising the black level helps ensure that the sensor maintains consistent linear output behavior across the entire dynamic range.
+                                                         */
+#define OMEGONPROCAM_OPTION_MULTITHREAD            0x16       /* [RW] multithread image processing */
+#define OMEGONPROCAM_OPTION_BINNING                0x17       /* [RW] digital binning
                                                                 0x01: (no binning)
                                                                 n: (saturating add, n*n), 0x02(2*2), 0x03(3*3), 0x04(4*4), 0x05(5*5), 0x06(6*6), 0x07(7*7), 0x08(8*8). The Bitdepth of the data remains unchanged.
                                                                 0x40 | n: (unsaturated add, n*n, works only in RAW mode), 0x42(2*2), 0x43(3*3), 0x44(4*4), 0x45(5*5), 0x46(6*6), 0x47(7*7), 0x48(8*8). The Bitdepth of the data is increased. For example, the original data with bitdepth of 12 will increase the bitdepth by 2 bits and become 14 after 2*2 binning.
                                                                 0x80 | n: (average, n*n), 0x82(2*2), 0x83(3*3), 0x84(4*4), 0x85(5*5), 0x86(6*6), 0x87(7*7), 0x88(8*8). The Bitdepth of the data remains unchanged.
                                                             The final image size is rounded down to an even number, such as 640/3 to get 212
                                                          */
-#define OMEGONPROCAM_OPTION_ROTATE                 0x18       /* rotate clockwise: 0, 90, 180, 270 */
-#define OMEGONPROCAM_OPTION_CG                     0x19       /* Conversion Gain:
+#define OMEGONPROCAM_OPTION_ROTATE                 0x18       /* [RW] rotate clockwise: 0, 90, 180, 270 */
+#define OMEGONPROCAM_OPTION_CG                     0x19       /* [RW] Conversion Gain:
                                                                 0 = LCG
                                                                 1 = HCG
                                                                 2 = HDR (for camera with flag OMEGONPROCAM_FLAG_CGHDR)
                                                                 2 = MCG (for camera with flag OMEGONPROCAM_FLAG_GHOPTO)
                                                          */
-#define OMEGONPROCAM_OPTION_PIXEL_FORMAT           0x1a       /* pixel format, OMEGONPROCAM_PIXELFORMAT_xxxx */
-#define OMEGONPROCAM_OPTION_FFC                    0x1b       /* flat field correction
+#define OMEGONPROCAM_OPTION_PIXEL_FORMAT           0x1a       /* [RW] pixel format, OMEGONPROCAM_PIXELFORMAT_xxxx */
+#define OMEGONPROCAM_OPTION_FFC                    0x1b       /* [RW] flat field correction
                                                              set:
                                                                   0: disable
                                                                   1: enable
                                                                  -1: reset
-                                                                 (0xff000000 | n): set the average number to n, [1~255]
+                                                                 (0xff000000 | n): set the average number to n, [1, 255]
                                                              get:
                                                                   (val & 0xff): 0 => disable, 1 => enable, 2 => inited
                                                                   ((val & 0xff00) >> 8): sequence
                                                                   ((val & 0xff0000) >> 16): average number
                                                          */
-#define OMEGONPROCAM_OPTION_DDR_DEPTH              0x1c       /* the number of the frames that DDR can cache
+#define OMEGONPROCAM_OPTION_DDR_DEPTH              0x1c       /* [RW] the number of the frames that DDR can cache
                                                                  1: DDR cache only one frame
                                                                  0: Auto:
                                                                          => one for video mode when auto exposure is enabled
                                                                          => full capacity for others
                                                                 -1: DDR can cache frames to full capacity
+                                                            default: 0
                                                          */
-#define OMEGONPROCAM_OPTION_DFC                    0x1d       /* dark field correction
+#define OMEGONPROCAM_OPTION_DFC                    0x1d       /* [RW] dark field correction
                                                              set:
                                                                  0: disable
                                                                  1: enable
                                                                 -1: reset
-                                                                 (0xff000000 | n): set the average number to n, [1~255]
+                                                                 (0xff000000 | n): set the average number to n, [1, 255]
                                                              get:
                                                                  (val & 0xff): 0 => disable, 1 => enable, 2 => inited
                                                                  ((val & 0xff00) >> 8): sequence
                                                                  ((val & 0xff0000) >> 16): average number
                                                          */
-#define OMEGONPROCAM_OPTION_SHARPENING             0x1e       /* Sharpening: (threshold << 24) | (radius << 16) | strength)
+#define OMEGONPROCAM_OPTION_SHARPENING             0x1e       /* [RW] Sharpening: (threshold << 24) | (radius << 16) | strength)
                                                              strength: [0, 500], default: 0 (disable)
                                                              radius: [1, 10]
                                                              threshold: [0, 255]
                                                          */
-#define OMEGONPROCAM_OPTION_FACTORY                0x1f       /* restore the factory settings */
-#define OMEGONPROCAM_OPTION_TEC_VOLTAGE            0x20       /* get the current TEC voltage in 0.1V, 59 mean 5.9V; readonly */
-#define OMEGONPROCAM_OPTION_TEC_VOLTAGE_MAX        0x21       /* TEC maximum voltage in 0.1V */
-#define OMEGONPROCAM_OPTION_DEVICE_RESET           0x22       /* reset usb device, simulate a replug */
-#define OMEGONPROCAM_OPTION_UPSIDE_DOWN            0x23       /* upsize down:
+#define OMEGONPROCAM_OPTION_FACTORY                0x1f       /* [WO] restore the factory settings */
+#define OMEGONPROCAM_OPTION_TEC_VOLTAGE            0x20       /* [RO] get the current TEC voltage in 0.1V, 59 mean 5.9V; readonly */
+#define OMEGONPROCAM_OPTION_TEC_VOLTAGE_MAX        0x21       /* [RW] TEC maximum voltage in 0.1V */
+#define OMEGONPROCAM_OPTION_DEVICE_RESET           0x22       /* [WO] reset usb device, simulate a replug */
+#define OMEGONPROCAM_OPTION_UPSIDE_DOWN            0x23       /* [RW] upsize down:
                                                              1: yes
                                                              0: no
                                                              default: 1 (win), 0 (linux/macos)
                                                          */
-#define OMEGONPROCAM_OPTION_FOCUSPOS               0x24       /* focus positon */
-#define OMEGONPROCAM_OPTION_AFMODE                 0x25       /* auto focus mode, see OmegonprocamAFMode */
-#define OMEGONPROCAM_OPTION_AFSTATUS               0x27       /* auto focus status, see OmegonprocamAFStaus */
-#define OMEGONPROCAM_OPTION_TESTPATTERN            0x28       /* test pattern:
+#define OMEGONPROCAM_OPTION_FOCUSPOS               0x24       /* [RW] focus positon */
+#define OMEGONPROCAM_OPTION_AFMODE                 0x25       /* [RW] auto focus mode, see OmegonprocamAFMode */
+#define OMEGONPROCAM_OPTION_AFSTATUS               0x27       /* [RO] auto focus status, see OmegonprocamAFStaus */
+#define OMEGONPROCAM_OPTION_TESTPATTERN            0x28       /* [RW] test pattern:
                                                             0: off
                                                             3: monochrome diagonal stripes
                                                             5: monochrome vertical stripes
                                                             7: monochrome horizontal stripes
                                                             9: chromatic diagonal stripes
                                                          */
-#define OMEGONPROCAM_OPTION_AUTOEXP_THRESHOLD      0x29       /* threshold of auto exposure, default value: 5, range = [2, 15] */
-#define OMEGONPROCAM_OPTION_BYTEORDER              0x2a       /* Byte order, BGR or RGB: 0 => RGB, 1 => BGR, default value: 1(Win), 0(macOS, Linux, Android) */
-#define OMEGONPROCAM_OPTION_NOPACKET_TIMEOUT       0x2b       /* no packet timeout: 0 => disable, positive value (>= OMEGONPROCAM_NOPACKET_TIMEOUT_MIN) => timeout milliseconds. default: disable */
-#define OMEGONPROCAM_OPTION_MAX_PRECISE_FRAMERATE  0x2c       /* get the precise frame rate maximum value in 0.1 fps, such as 115 means 11.5 fps */
-#define OMEGONPROCAM_OPTION_PRECISE_FRAMERATE      0x2d       /* precise frame rate current value in 0.1 fps. use OMEGONPROCAM_OPTION_MAX_PRECISE_FRAMERATE, OMEGONPROCAM_OPTION_MIN_PRECISE_FRAMERATE to get the range. if the set value is out of range, E_INVALIDARG will be returned */
-#define OMEGONPROCAM_OPTION_BANDWIDTH              0x2e       /* bandwidth, [1-100]% */
-#define OMEGONPROCAM_OPTION_RELOAD                 0x2f       /* reload the last frame in trigger mode */
-#define OMEGONPROCAM_OPTION_CALLBACK_THREAD        0x30       /* dedicated thread for callback: 0 => disable, 1 => enable, default: 0 */
-#define OMEGONPROCAM_OPTION_FRONTEND_DEQUE_LENGTH  0x31       /* frontend (raw) frame buffer deque length, range: [2, 1024], default: 4
+#define OMEGONPROCAM_OPTION_AUTOEXP_THRESHOLD      0x29       /* [RW] threshold of auto exposure, default value: 5, range = [2, 15] */
+#define OMEGONPROCAM_OPTION_BYTEORDER              0x2a       /* [RW] Byte order, BGR or RGB: 0 => RGB, 1 => BGR, default value: 1(Win), 0(macOS, Linux, Android) */
+#define OMEGONPROCAM_OPTION_NOPACKET_TIMEOUT       0x2b       /* [RW] no packet timeout: 0 => disable, positive value (>= OMEGONPROCAM_NOPACKET_TIMEOUT_MIN) => timeout milliseconds. default: disable */
+#define OMEGONPROCAM_OPTION_MAX_PRECISE_FRAMERATE  0x2c       /* [RO] get the precise frame rate maximum value in 0.1 fps, such as 115 means 11.5 fps */
+#define OMEGONPROCAM_OPTION_PRECISE_FRAMERATE      0x2d       /* [RW] precise frame rate current value in 0.1 fps. use OMEGONPROCAM_OPTION_MAX_PRECISE_FRAMERATE, OMEGONPROCAM_OPTION_MIN_PRECISE_FRAMERATE to get the range. if the set value is out of range, E_INVALIDARG will be returned */
+#define OMEGONPROCAM_OPTION_BANDWIDTH              0x2e       /* [RW] bandwidth, [1-100]% */
+#define OMEGONPROCAM_OPTION_RELOAD                 0x2f       /* [RW] reload the last frame in trigger mode */
+#define OMEGONPROCAM_OPTION_CALLBACK_THREAD        0x30       /* [RW] dedicated thread for callback: 0 => disable, 1 => enable
+                                                                 default: 1
+                                                         */
+#define OMEGONPROCAM_OPTION_FRONTEND_DEQUE_LENGTH  0x31       /* [RW] frontend (raw) frame buffer deque length, range: [2, 1024], default: 4
                                                             All the memory will be pre-allocated when the camera starts, so, please attention to memory usage
                                                          */
-#define OMEGONPROCAM_OPTION_FRAME_DEQUE_LENGTH     0x31       /* alias of OMEGONPROCAM_OPTION_FRONTEND_DEQUE_LENGTH */
-#define OMEGONPROCAM_OPTION_MIN_PRECISE_FRAMERATE  0x32       /* get the precise frame rate minimum value in 0.1 fps, such as 15 means 1.5 fps */
-#define OMEGONPROCAM_OPTION_SEQUENCER_ONOFF        0x33       /* sequencer trigger: on/off */
-#define OMEGONPROCAM_OPTION_SEQUENCER_NUMBER       0x34       /* sequencer trigger: number, range = [1, 255] */
-#define OMEGONPROCAM_OPTION_SEQUENCER_EXPOTIME     0x01000000 /* sequencer trigger: exposure time, iOption = OMEGONPROCAM_OPTION_SEQUENCER_EXPOTIME | index, iValue = exposure time
+#define OMEGONPROCAM_OPTION_FRAME_DEQUE_LENGTH     0x31       /* [RW] alias of OMEGONPROCAM_OPTION_FRONTEND_DEQUE_LENGTH */
+#define OMEGONPROCAM_OPTION_MIN_PRECISE_FRAMERATE  0x32       /* [RO] get the precise frame rate minimum value in 0.1 fps, such as 15 means 1.5 fps */
+#define OMEGONPROCAM_OPTION_SEQUENCER_ONOFF        0x33       /* [RW] sequencer trigger: on/off */
+#define OMEGONPROCAM_OPTION_SEQUENCER_NUMBER       0x34       /* [RW] sequencer trigger: number, range = [1, 255] */
+#define OMEGONPROCAM_OPTION_SEQUENCER_EXPOTIME     0x01000000 /* [RW] sequencer trigger: exposure time, iOption = OMEGONPROCAM_OPTION_SEQUENCER_EXPOTIME | index, iValue = exposure time
                                                              For example, to set the exposure time of the third group to 50ms, call:
                                                                 Omegonprocam_put_Option(OMEGONPROCAM_OPTION_SEQUENCER_EXPOTIME | 3, 50000)
                                                          */
-#define OMEGONPROCAM_OPTION_SEQUENCER_EXPOGAIN     0x02000000 /* sequencer trigger: exposure gain, iOption = OMEGONPROCAM_OPTION_SEQUENCER_EXPOGAIN | index, iValue = gain */
-#define OMEGONPROCAM_OPTION_DENOISE                0x35       /* denoise, strength range: [0, 100], 0 means disable */
-#define OMEGONPROCAM_OPTION_HEAT_MAX               0x36       /* get maximum level: heat to prevent fogging up */
-#define OMEGONPROCAM_OPTION_HEAT                   0x37       /* heat to prevent fogging up */
-#define OMEGONPROCAM_OPTION_LOW_NOISE              0x38       /* low noise mode (Higher signal noise ratio, lower frame rate): 1 => enable */
-#define OMEGONPROCAM_OPTION_POWER                  0x39       /* get power consumption, unit: milliwatt */
-#define OMEGONPROCAM_OPTION_GLOBAL_RESET_MODE      0x3a       /* global reset mode */
-#define OMEGONPROCAM_OPTION_OPEN_ERRORCODE         0x3b       /* get the open camera error code */
-#define OMEGONPROCAM_OPTION_FLUSH                  0x3d       /* 1 = hard flush, discard frames cached by camera DDR (if any)
+#define OMEGONPROCAM_OPTION_SEQUENCER_EXPOGAIN     0x02000000 /* [RW] sequencer trigger: exposure gain, iOption = OMEGONPROCAM_OPTION_SEQUENCER_EXPOGAIN | index, iValue = gain */
+#define OMEGONPROCAM_OPTION_DENOISE                0x35       /* [RW] denoise, strength range: [0, 100], 0 means disable */
+#define OMEGONPROCAM_OPTION_HEAT_MAX               0x36       /* [RO] get maximum level: heat to prevent fogging up */
+#define OMEGONPROCAM_OPTION_HEAT                   0x37       /* [RW] heat to prevent fogging up */
+#define OMEGONPROCAM_OPTION_LOW_NOISE              0x38       /* [RW] low noise mode (Higher signal noise ratio, lower frame rate): 1 => enable */
+#define OMEGONPROCAM_OPTION_POWER                  0x39       /* [RO] get power consumption, unit: milliwatt */
+#define OMEGONPROCAM_OPTION_GLOBAL_RESET_MODE      0x3a       /* [RW] global reset mode */
+#define OMEGONPROCAM_OPTION_OPEN_ERRORCODE         0x3b       /* [RO] get the open camera error code */
+#define OMEGONPROCAM_OPTION_FLUSH                  0x3d       /* [WO]
+                                                            1 = hard flush, discard frames cached by camera DDR (if any)
                                                             2 = soft flush, discard frames cached by omegonprocam.dll (if any)
                                                             3 = both flush
                                                             Omegonprocam_Flush means 'both flush'
                                                             return the number of soft flushed frames if successful, HRESULT if failed
                                                          */
-#define OMEGONPROCAM_OPTION_NUMBER_DROP_FRAME      0x3e       /* get the number of frames that have been grabbed from the USB but dropped by the software */
-#define OMEGONPROCAM_OPTION_DUMP_CFG               0x3f       /* 0 = when camera is stopped, do not dump configuration automatically
+#define OMEGONPROCAM_OPTION_NUMBER_DROP_FRAME      0x3e       /* [RO] get the number of frames that have been grabbed from the USB but dropped by the software */
+#define OMEGONPROCAM_OPTION_DUMP_CFG               0x3f       /* [RW] 0 = when camera is stopped, do not dump configuration automatically
                                                             1 = when camera is stopped, dump configuration automatically
                                                             -1 = explicitly dump configuration once
                                                             default: 1
                                                          */
-#define OMEGONPROCAM_OPTION_DEFECT_PIXEL           0x40       /* Defect Pixel Correction: 0 => disable, 1 => enable; default: 1 */
-#define OMEGONPROCAM_OPTION_BACKEND_DEQUE_LENGTH   0x41       /* backend (pipelined) frame buffer deque length (Only available in pull mode), range: [2, 1024], default: 3
+#define OMEGONPROCAM_OPTION_DEFECT_PIXEL           0x40       /* [RW] Defect Pixel Correction: 0 => disable, 1 => enable; default: 1 */
+#define OMEGONPROCAM_OPTION_BACKEND_DEQUE_LENGTH   0x41       /* [RW] backend (pipelined) frame buffer deque length (Only available in pull mode), range: [2, 1024], default: 3
                                                             All the memory will be pre-allocated when the camera starts, so, please attention to memory usage
                                                          */
-#define OMEGONPROCAM_OPTION_LIGHTSOURCE_MAX        0x42       /* get the light source range, [0 ~ max] */
-#define OMEGONPROCAM_OPTION_LIGHTSOURCE            0x43       /* light source */
-#define OMEGONPROCAM_OPTION_HEARTBEAT              0x44       /* Heartbeat interval in millisecond, range = [OMEGONPROCAM_HEARTBEAT_MIN, OMEGONPROCAM_HEARTBEAT_MAX], 0 = disable, default: disable */
-#define OMEGONPROCAM_OPTION_FRONTEND_DEQUE_CURRENT 0x45       /* get the current number in frontend deque */
-#define OMEGONPROCAM_OPTION_BACKEND_DEQUE_CURRENT  0x46       /* get the current number in backend deque */
-#define OMEGONPROCAM_OPTION_EVENT_HARDWARE         0x04000000 /* enable or disable hardware event: 0 => disable, 1 => enable; default: disable
+#define OMEGONPROCAM_OPTION_LIGHTSOURCE_MAX        0x42       /* [RO] get the light source range, [0, max] */
+#define OMEGONPROCAM_OPTION_LIGHTSOURCE            0x43       /* [RW] light source */
+#define OMEGONPROCAM_OPTION_HEARTBEAT              0x44       /* [RW] Heartbeat interval in millisecond, range = [OMEGONPROCAM_HEARTBEAT_MIN, OMEGONPROCAM_HEARTBEAT_MAX], 0 = disable, default: disable */
+#define OMEGONPROCAM_OPTION_FRONTEND_DEQUE_CURRENT 0x45       /* [RO] get the current number in frontend deque */
+#define OMEGONPROCAM_OPTION_BACKEND_DEQUE_CURRENT  0x46       /* [RO] get the current number in backend deque */
+#define OMEGONPROCAM_OPTION_EVENT_HARDWARE         0x04000000 /* [RW] enable or disable hardware event: 0 => disable, 1 => enable; default: disable
                                                                 (1) iOption = OMEGONPROCAM_OPTION_EVENT_HARDWARE, master switch for notification of all hardware events
                                                                 (2) iOption = OMEGONPROCAM_OPTION_EVENT_HARDWARE | (event type), a specific type of sub-switch
                                                             Only if both the master switch and the sub-switch of a particular type remain on are actually enabled for that type of event notification.
                                                          */
-#define OMEGONPROCAM_OPTION_PACKET_NUMBER          0x47       /* get the received packet number */
-#define OMEGONPROCAM_OPTION_FILTERWHEEL_SLOT       0x48       /* filter wheel slot number */
-#define OMEGONPROCAM_OPTION_FILTERWHEEL_POSITION   0x49       /* filter wheel position:
+#define OMEGONPROCAM_OPTION_PACKET_NUMBER          0x47       /* [RO] get the received packet number */
+#define OMEGONPROCAM_OPTION_FILTERWHEEL_SLOT       0x48       /* [RW] filter wheel slot number */
+#define OMEGONPROCAM_OPTION_FILTERWHEEL_POSITION   0x49       /* [RW] filter wheel position:
                                                                 set:
                                                                     -1: reset
                                                                     val & 0xff: position between 0 and N-1, where N is the number of filter slots
@@ -1034,41 +1144,41 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_feed_Pipe(HOmegonprocam h, unsigned pipe
                                                                      -1: in motion
                                                                      val: position arrived
                                                          */
-#define OMEGONPROCAM_OPTION_AUTOEXPOSURE_PERCENT   0x4a       /* auto exposure percent to average:
+#define OMEGONPROCAM_OPTION_AUTOEXPOSURE_PERCENT   0x4a       /* [RW] auto exposure percent to average:
                                                                 1~99: peak percent average
                                                                 0 or 100: full roi average, means "disabled"
                                                          */
-#define OMEGONPROCAM_OPTION_ANTI_SHUTTER_EFFECT    0x4b       /* anti shutter effect: 1 => enable, 0 => disable; default: 0 */
-#define OMEGONPROCAM_OPTION_CHAMBER_HT             0x4c       /* get chamber humidity & temperature:
+#define OMEGONPROCAM_OPTION_ANTI_SHUTTER_EFFECT    0x4b       /* [RW] anti shutter effect: 1 => enable, 0 => disable; default: 0 */
+#define OMEGONPROCAM_OPTION_CHAMBER_HT             0x4c       /* [RO] get chamber humidity & temperature:
                                                                 high 16 bits: humidity, in 0.1%, such as: 325 means humidity is 32.5%
                                                                 low 16 bits: temperature, in 0.1 degrees Celsius, such as: 32 means 3.2 degrees Celsius
                                                          */
-#define OMEGONPROCAM_OPTION_ENV_HT                 0x4d       /* get environment humidity & temperature */
-#define OMEGONPROCAM_OPTION_EXPOSURE_PRE_DELAY     0x4e       /* exposure signal pre-delay, microsecond */
-#define OMEGONPROCAM_OPTION_EXPOSURE_POST_DELAY    0x4f       /* exposure signal post-delay, microsecond */
-#define OMEGONPROCAM_OPTION_AUTOEXPO_CONV          0x50       /* get auto exposure convergence status: 1(YES) or 0(NO), -1(NA) */
-#define OMEGONPROCAM_OPTION_AUTOEXPO_TRIGGER       0x51       /* auto exposure on trigger mode: 0 => disable, 1 => enable; default: 0 */
-#define OMEGONPROCAM_OPTION_LINE_PRE_DELAY         0x52       /* specified line signal pre-delay, microsecond */
-#define OMEGONPROCAM_OPTION_LINE_POST_DELAY        0x53       /* specified line signal post-delay, microsecond */
-#define OMEGONPROCAM_OPTION_TEC_VOLTAGE_MAX_RANGE  0x54       /* get the tec maximum voltage range:
+#define OMEGONPROCAM_OPTION_ENV_HT                 0x4d       /* [RO] get environment humidity & temperature */
+#define OMEGONPROCAM_OPTION_EXPOSURE_PRE_DELAY     0x4e       /* [RW] exposure signal pre-delay, microsecond */
+#define OMEGONPROCAM_OPTION_EXPOSURE_POST_DELAY    0x4f       /* [RW] exposure signal post-delay, microsecond */
+#define OMEGONPROCAM_OPTION_AUTOEXPO_CONV          0x50       /* [RO] get auto exposure convergence status: 1(YES) or 0(NO), -1(PENDING) */
+#define OMEGONPROCAM_OPTION_AUTOEXPO_TRIGGER       0x51       /* [RW] auto exposure on trigger mode: 0 => disable, 1 => enable; default: 0 */
+#define OMEGONPROCAM_OPTION_LINE_PRE_DELAY         0x52       /* [RW] specified line signal pre-delay, microsecond */
+#define OMEGONPROCAM_OPTION_LINE_POST_DELAY        0x53       /* [RW] specified line signal post-delay, microsecond */
+#define OMEGONPROCAM_OPTION_TEC_VOLTAGE_MAX_RANGE  0x54       /* [RO] get the tec maximum voltage range:
                                                                 high 16 bits: max
                                                                 low 16 bits: min
                                                          */
-#define OMEGONPROCAM_OPTION_HIGH_FULLWELL          0x55       /* high fullwell capacity: 0 => disable, 1 => enable */
-#define OMEGONPROCAM_OPTION_DYNAMIC_DEFECT         0x56       /* dynamic defect pixel correction:
+#define OMEGONPROCAM_OPTION_HIGH_FULLWELL          0x55       /* [RW] high fullwell capacity: 0 => disable, 1 => enable */
+#define OMEGONPROCAM_OPTION_DYNAMIC_DEFECT         0x56       /* [RW] dynamic defect pixel correction:
                                                                 dead pixel ratio, t1: (high 16 bits): [0, 100], means: [0.0, 1.0]
                                                                 hot pixel ratio, t2: (low 16 bits): [0, 100], means: [0.0, 1.0]
                                                          */
-#define OMEGONPROCAM_OPTION_HDR_KB                 0x57       /* HDR synthesize
+#define OMEGONPROCAM_OPTION_HDR_KB                 0x57       /* [RW] HDR synthesize
                                                                 K (high 16 bits): [1, 25500]
                                                                 B (low 16 bits): [0, 65535]
                                                                 0xffffffff => set to default
                                                          */
-#define OMEGONPROCAM_OPTION_HDR_THRESHOLD          0x58       /* HDR synthesize
+#define OMEGONPROCAM_OPTION_HDR_THRESHOLD          0x58       /* [RW] HDR synthesize
                                                                 threshold: [1, 4094]
                                                                 0xffffffff => set to default
                                                          */
-#define OMEGONPROCAM_OPTION_GIGETIMEOUT            0x5a       /* For GigE cameras, the application periodically sends heartbeat signals to the camera to keep the connection to the camera alive.
+#define OMEGONPROCAM_OPTION_GIGETIMEOUT            0x5a       /* [RW] For GigE cameras, the application periodically sends heartbeat signals to the camera to keep the connection to the camera alive.
                                                             If the camera doesn't receive heartbeat signals within the time period specified by the heartbeat timeout counter, the camera resets the connection.
                                                             When the application is stopped by the debugger, the application cannot send the heartbeat signals
                                                                 0 => auto: when the camera is opened, enable if no debugger is present or disable if debugger is present
@@ -1076,100 +1186,139 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_feed_Pipe(HOmegonprocam h, unsigned pipe
                                                                 2 => disable
                                                                 default: auto
                                                          */
-#define OMEGONPROCAM_OPTION_EEPROM_SIZE            0x5b       /* get EEPROM size */
-#define OMEGONPROCAM_OPTION_OVERCLOCK_MAX          0x5c       /* get overclock range: [0, max] */
-#define OMEGONPROCAM_OPTION_OVERCLOCK              0x5d       /* overclock, default: 0 */
-#define OMEGONPROCAM_OPTION_RESET_SENSOR           0x5e       /* reset sensor */
-#define OMEGONPROCAM_OPTION_ISP                    0x5f       /* Enable hardware ISP: 0 => auto (disable in RAW mode, otherwise enable), 1 => enable, -1 => disable; default: 0 */
-#define OMEGONPROCAM_OPTION_AUTOEXP_EXPOTIME_DAMP  0x60       /* Auto exposure damping coefficient: time (thousandths). The larger the damping coefficient, the smoother and slower the exposure time changes */
-#define OMEGONPROCAM_OPTION_AUTOEXP_GAIN_DAMP      0x61       /* Auto exposure damping coefficient: gain (thousandths). The larger the damping coefficient, the smoother and slower the gain changes */
-#define OMEGONPROCAM_OPTION_MOTOR_NUMBER           0x62       /* range: [1, 20] */
-#define OMEGONPROCAM_OPTION_MOTOR_POS              0x10000000 /* range: [1, 702] */
-#define OMEGONPROCAM_OPTION_PSEUDO_COLOR_START     0x63       /* Pseudo: start color, BGR format */
-#define OMEGONPROCAM_OPTION_PSEUDO_COLOR_END       0x64       /* Pseudo: end color, BGR format */
-#define OMEGONPROCAM_OPTION_PSEUDO_COLOR_ENABLE    0x65       /* Pseudo: -1 => custom: use startcolor & endcolor to generate the colormap
-                                                                    0 => disable
-                                                                    1 => spot
-                                                                    2 => spring
-                                                                    3 => summer
-                                                                    4 => autumn
-                                                                    5 => winter
-                                                                    6 => bone
-                                                                    7 => jet
-                                                                    8 => rainbow
-                                                                    9 => deepgreen
-                                                                    10 => ocean
-                                                                    11 => cool
-                                                                    12 => hsv
-                                                                    13 => pink
-                                                                    14 => hot
-                                                                    15 => parula
-                                                                    16 => magma
-                                                                    17 => inferno
-                                                                    18 => plasma
-                                                                    19 => viridis
-                                                                    20 => cividis
-                                                                    21 => twilight
-                                                                    22 => twilight_shifted
-                                                                    23 => turbo
-                                                                    24 => red
-                                                                    25 => green
-                                                                    26 => blue
+#define OMEGONPROCAM_OPTION_EEPROM_SIZE            0x5b       /* [RO] get EEPROM size */
+#define OMEGONPROCAM_OPTION_OVERCLOCK_MAX          0x5c       /* [RO] get overclock range: [0, max] */
+#define OMEGONPROCAM_OPTION_OVERCLOCK              0x5d       /* [RW] overclock, default: 0 */
+#define OMEGONPROCAM_OPTION_RESET_SENSOR           0x5e       /* [WO] reset sensor */
+#define OMEGONPROCAM_OPTION_ISP                    0x5f       /* [RW] Enable hardware ISP: 0 => auto (disable in RAW mode, otherwise enable), 1 => enable, -1 => disable; default: 0 */
+#define OMEGONPROCAM_OPTION_AUTOEXP_EXPOTIME_DAMP  0x60       /* [RW] Auto exposure damping coefficient: time (thousandths). The larger the damping coefficient, the smoother and slower the exposure time changes */
+#define OMEGONPROCAM_OPTION_AUTOEXP_GAIN_DAMP      0x61       /* [RW] Auto exposure damping coefficient: gain (thousandths). The larger the damping coefficient, the smoother and slower the gain changes */
+#define OMEGONPROCAM_OPTION_MOTOR_NUMBER           0x62       /* [RW] range: [1, 20] */
+#define OMEGONPROCAM_OPTION_MOTOR_POS              0x10000000 /* [RW] range: [1, 702] */
+#define OMEGONPROCAM_OPTION_PSEUDO_COLOR_START     0x63       /* [RW] Pseudo: start color, BGR format */
+#define OMEGONPROCAM_OPTION_PSEUDO_COLOR_END       0x64       /* [RW] Pseudo: end color, BGR format */
+#define OMEGONPROCAM_OPTION_PSEUDO_COLOR_ENABLE    0x65       /* [RW] Pseudo: -1 => Custom: use startcolor & endcolor to generate the colormap
+                                                                    0 => Disable
+                                                                    1 => Spot
+                                                                    2 => Spring
+                                                                    3 => Summer
+                                                                    4 => Autumn
+                                                                    5 => Winter
+                                                                    6 => Bone
+                                                                    7 => Jet
+                                                                    8 => Rainbow
+                                                                    9 => DeepGreen
+                                                                    10 => Ocean
+                                                                    11 => Cool
+                                                                    12 => HSV
+                                                                    13 => Pink
+                                                                    14 => Hot
+                                                                    15 => Parula
+                                                                    16 => Magma
+                                                                    17 => Inferno
+                                                                    18 => Plasma
+                                                                    19 => Viridis
+                                                                    20 => Cividis
+                                                                    21 => Twilight
+                                                                    22 => TwilightShifted
+                                                                    23 => Turbo
+                                                                    24 => Red
+                                                                    25 => Green
+                                                                    26 => Blue
+                                                                    27 => Spectrum
                                                          */
-#define OMEGONPROCAM_OPTION_LOW_POWERCONSUMPTION   0x66       /* Low Power Consumption: 0 => disable, 1 => enable */
-#define OMEGONPROCAM_OPTION_FPNC                   0x67       /* Fix Pattern Noise Correction
+#define OMEGONPROCAM_OPTION_LOW_POWERCONSUMPTION   0x66       /* [RW] Low Power Consumption: 0 => disable, 1 => enable */
+#define OMEGONPROCAM_OPTION_FPNC                   0x67       /* [RW] Fix Pattern Noise Correction
                                                              set:
                                                                  0: disable
                                                                  1: enable
                                                                 -1: reset
-                                                                 (0xff000000 | n): set the average number to n, [1~255]
+                                                                 (0xff000000 | n): set the average number to n, [1, 255]
                                                              get:
                                                                  (val & 0xff): 0 => disable, 1 => enable, 2 => inited
                                                                  ((val & 0xff00) >> 8): sequence
                                                                  ((val & 0xff0000) >> 16): average number
                                                          */
-#define OMEGONPROCAM_OPTION_OVEREXP_POLICY         0x68       /* Auto exposure over exposure policy: when overexposed,
+#define OMEGONPROCAM_OPTION_OVEREXP_POLICY         0x68       /* [RW] Auto exposure overexposure policy: when overexposed,
                                                                 0 => directly reduce the exposure time/gain to the minimum value; or
-                                                                1 => reduce exposure time/gain in proportion to current and target brightness.
-                                                                n(n>1) => first adjust the exposure time to (maximum automatic exposure time * maximum automatic exposure gain) * n / 1000, and then adjust according to the strategy of 1
+                                                                1 => reduce exposure time/gain according to the ratio between current and target brightness; or
+                                                                n(n>1) => first, adjust the exposure time to (maximum automatic exposure time * maximum automatic exposure gain) * n / 1000, and then adjust according to the strategy of 1
                                                             The advantage of policy 0 is that the convergence speed is faster, but there is black screen.
                                                             Policy 1 avoids the black screen, but the convergence speed is slower.
                                                             Default: 0
                                                          */
-#define OMEGONPROCAM_OPTION_READOUT_MODE           0x69       /* Readout mode: 0 = IWR (Integrate While Read), 1 = ITR (Integrate Then Read)
+#define OMEGONPROCAM_OPTION_READOUT_MODE           0x69       /* [RW] Readout mode: 0 = IWR (Integrate While Read), 1 = ITR (Integrate Then Read)
                                                               The working modes of the detector readout circuit can be divided into two types: ITR and IWR. Using the IWR readout mode can greatly increase the frame rate. In the ITR mode, the integration of the (n+1)th frame starts after all the data of the nth frame are read out, while in the IWR mode, the data of the nth frame is read out at the same time when the (n+1)th frame is integrated
                                                          */
-#define OMEGONPROCAM_OPTION_TAILLIGHT              0x6a       /* Turn on/off tail Led light: 0 => off, 1 => on; default: on */
-#define OMEGONPROCAM_OPTION_LENSSTATE              0x6b       /* Load/Save lens state to EEPROM: 0 => load, 1 => save */
-#define OMEGONPROCAM_OPTION_AWB_CONTINUOUS         0x6c       /* Auto White Balance: continuous mode
+#define OMEGONPROCAM_OPTION_TAILLIGHT              0x6a       /* [RW] Turn on/off tail Led light: 0 => off, 1 => on; default: on */
+#define OMEGONPROCAM_OPTION_LENSSTATE              0x6b       /* [RW] Load/Save lens state to EEPROM: 0 => load, 1 => save */
+#define OMEGONPROCAM_OPTION_AWB_CONTINUOUS         0x6c       /* [RW] Auto White Balance: continuous mode
                                                                 0:  disable (default)
                                                                 n>0: every n millisecond(s)
                                                                 n<0: every -n frame
                                                          */
-#define OMEGONPROCAM_OPTION_TECTARGET_RANGE        0x6d       /* TEC target range: min(low 16 bits) = (short)(val & 0xffff), max(high 16 bits) = (short)((val >> 16) & 0xffff) */
-#define OMEGONPROCAM_OPTION_CDS                    0x6e       /* Correlated Double Sampling */
-#define OMEGONPROCAM_OPTION_LOW_POWER_EXPOTIME     0x6f       /* Low Power Consumption: Enable if exposure time is greater than the set value */
-#define OMEGONPROCAM_OPTION_ZERO_OFFSET            0x70       /* Sensor output offset to zero: 0 => disable, 1 => eanble; default: 0 */
-#define OMEGONPROCAM_OPTION_GVCP_TIMEOUT           0x71       /* GVCP Timeout: millisecond, range = [3, 75], default: 15
+#define OMEGONPROCAM_OPTION_TECTARGET_RANGE        0x6d       /* [RO] TEC target range: min(low 16 bits) = (short)(val & 0xffff), max(high 16 bits) = (short)((val >> 16) & 0xffff) */
+#define OMEGONPROCAM_OPTION_CDS                    0x6e       /* [RW] Correlated Double Sampling: 0~max (OMEGONPROCAM_OPTION_CDS_MAX)
+                                                              see https://www.next.gr/tutorials/sensors-and-transducers/image-sensor-noise-reduction-techniques-tutorial#correlated-double-sampling-cds
+                                                         */
+#define OMEGONPROCAM_OPTION_LOW_POWER_EXPOTIME     0x6f       /* [RW] Low Power Consumption: Enable if exposure time is greater than the set value */
+#define OMEGONPROCAM_OPTION_ZERO_OFFSET            0x70       /* [RW] Sensor output offset to zero: 0 => disable, 1 => eanble; default: 0 */
+#define OMEGONPROCAM_OPTION_GVCP_TIMEOUT           0x71       /* [RW] GVCP Timeout: millisecond, range = [5, 150], default: 15(wire), 30(wireless)
                                                               Unless in very special circumstances, generally no modification is required, just use the default value
                                                          */
-#define OMEGONPROCAM_OPTION_GVCP_RETRY             0x72       /* GVCP Retry: range = [2, 8], default: 4
+#define OMEGONPROCAM_OPTION_GVCP_RETRY             0x72       /* [RW] GVCP Retry: range = [2, 16], default: 4(wire), 8(wireless)
                                                               Unless in very special circumstances, generally no modification is required, just use the default value
                                                          */
-#define OMEGONPROCAM_OPTION_GVSP_WAIT_PERCENT      0x73       /* GVSP wait percent: range = [0, 100], default = (trigger mode: 100, realtime: 0, other: 1) */
-#define OMEGONPROCAM_OPTION_RESET_SEQ_TIMESTAMP    0x74       /* Reset to 0: 1 => seq; 2 => timestamp; 3 => both */
-#define OMEGONPROCAM_OPTION_TRIGGER_CANCEL_MODE    0x75       /* Trigger cancel mode: 0 => no frame, 1 => output frame; default: 0 */
-#define OMEGONPROCAM_OPTION_MECHANICALSHUTTER      0x76       /* Mechanical shutter: 0 => open, 1 => close; default: 0 */
-#define OMEGONPROCAM_OPTION_LINE_TIME              0x77       /* Line-time of sensor in nanosecond */
-#define OMEGONPROCAM_OPTION_ZERO_PADDING           0x78       /* Zero padding: 0 => high, 1 => low; default: 0 */
-#define OMEGONPROCAM_OPTION_UPTIME                 0x79       /* device uptime in millisecond */
-#define OMEGONPROCAM_OPTION_BITRANGE               0x7a       /* Bit range: [0, 8] */
-#define OMEGONPROCAM_OPTION_MODE_SEQ_TIMESTAMP     0x7b       /* Mode of seq & timestamp: 0 => reset to 0 automatically; 1 => never reset automatically; default: 0 */
-#define TOUPCAP_OPTION_TIMED_TRIGGER_NUM      0x7c       /* Timed trigger number */
-#define OMEGONPROCAM_OPTION_TIMED_TRIGGER_LOW      0x20000000 /* Timed trigger: lower 32 bits of  64-bit integer, nanosecond since epoch (00:00:00 UTC on Thursday, 1 January 1970, see https://en.wikipedia.org/wiki/Unix_time) */
-#define OMEGONPROCAM_OPTION_TIMED_TRIGGER_HIGH     0x40000000 /* Timed trigger: high 32 bits. The lower 32 bits must be set first, followed by the higher 32 bits */
-#define OMEGONPROCAM_OPTION_AUTOEXP_THLD_TRIGGER   0x7d       /* trigger threshold of auto exposure */
-#define OMEGONPROCAM_OPTION_LANE                   0x7e
+#define OMEGONPROCAM_OPTION_GVSP_WAIT_PERCENT      0x73       /* [RW] GVSP wait percent: range = [0, 100], default = (trigger mode: 100, realtime: 0, other: 1) */
+#define OMEGONPROCAM_OPTION_RESET_SEQ_TIMESTAMP    0x74       /* [WO] Reset to 0: 1 => seq; 2 => timestamp; 3 => both */
+#define OMEGONPROCAM_OPTION_TRIGGER_CANCEL_MODE    0x75       /* [RW] Trigger cancel mode: 0 => no frame, 1 => output frame; default: 0 */
+#define OMEGONPROCAM_OPTION_MECHANICALSHUTTER      0x76       /* [RW] Mechanical shutter: 0 => open, 1 => close; default: 0 */
+#define OMEGONPROCAM_OPTION_LINE_TIME              0x77       /* [RO] Line-time of sensor in nanosecond */
+#define OMEGONPROCAM_OPTION_ZERO_PADDING           0x78       /* [RW] Zero padding: 0 => high, 1 => low; default: 0 */
+#define OMEGONPROCAM_OPTION_UPTIME                 0x79       /* [RO] device uptime in millisecond */
+#define OMEGONPROCAM_OPTION_BITRANGE               0x7a       /* [RW] Bit range: [0, 8] */
+#define OMEGONPROCAM_OPTION_MODE_SEQ_TIMESTAMP     0x7b       /* [RW] Mode of seq & timestamp: 0 => reset to 0 automatically; 1 => never reset automatically; default: 0 */
+#define OMEGONPROCAM_OPTION_TIMED_TRIGGER_NUM      0x7c       /* [RW] Timed trigger number */
+#define OMEGONPROCAM_OPTION_TIMED_TRIGGER_LOW      0x20000000 /* [RW] Timed trigger: lower 32 bits of 64-bit integer, nanosecond since epoch (00:00:00 UTC on Thursday, 1 January 1970, see https://en.wikipedia.org/wiki/Unix_time) */
+#define OMEGONPROCAM_OPTION_TIMED_TRIGGER_HIGH     0x40000000 /* [RW] Timed trigger: high 32 bits. The lower 32 bits must be set first, followed by the higher 32 bits */
+#define OMEGONPROCAM_OPTION_AUTOEXP_THLD_TRIGGER   0x7d       /* [RW] trigger threshold of auto exposure */
+#define OMEGONPROCAM_OPTION_LANE                   0x7e       /* [RW] Lane */
+#define OMEGONPROCAM_OPTION_VOLTAGEBIAS            0x7f       /* [RW] Voltage bias */
+#define OMEGONPROCAM_OPTION_VOLTAGEBIAS_RANGE      0x80       /* [RO] Voltage bias range: min (low 16bits), max (high 16bits) */
+#define OMEGONPROCAM_OPTION_READ_TIME              0x81       /* [RO] */
+#define OMEGONPROCAM_OPTION_ALL_EXPO_TIME          0x82       /* [RO] */
+#define OMEGONPROCAM_OPTION_CAMERA_PERIOD          0x83       /* [RO] */
+#define OMEGONPROCAM_OPTION_FRONTEND_FULL          0x84       /* [RO] get the number of frontend deque full */
+#define OMEGONPROCAM_OPTION_BACKEND_FULL           0x85       /* [RO] get the number of backend deque full */
+#define OMEGONPROCAM_OPTION_GPS                    0x86       /* [RO] gps status: 0 => not supported; -1 => gps device offline; 1 => gps device online */
+#define OMEGONPROCAM_OPTION_LINE_LENGTH            0x87       /* [RW] Line length in pixel clock */
+#define OMEGONPROCAM_OPTION_SCAN_DIRECTION         0x88       /* [RW] Scan direction: 0(forward), 1(reverse), 2(alternate) */
+#define OMEGONPROCAM_OPTION_BLACKLEVEL_AUTOADJUST  0x89       /* [RW] Black level automatic adjustment function: 0: off, 1: on
+                                                                This setting turn on/off black level auto adjust function by OB(Optical Black) level.
+                                                                In case of long exposure and so on, OB level is offset by leak or any other reason.
+                                                                Because of it, if the adjustment becomes a problem, this setting is introduced for one of the solution.
+                                                         */
+#define OMEGONPROCAM_OPTION_USER_SET               0x8a       /* [RW] user set */
+#define OMEGONPROCAM_OPTION_DIGITAL_GAIN           0x1001     /* [RW] digital gain */
+#define OMEGONPROCAM_OPTION_ANTI_BLOOMING          0x8b       /* [RW] Anti Blooming, maximum
+                                                              Blooming occurs when the charge in a pixel exceeds the saturation level and the charge starts to fill adjacent pixels.
+                                                              Some sensors are designed with structures built into them to limit blooming - anti-blooming structures.
+                                                              Anti-blooming structures bleed off any excess charge before they can overflow the pixel and thereby stop blooming.
+                                                              However, anti-blooming structures can reduce the effective quantum efficiency and introduce non linearity into the sensor.
+                                                              Therefore, anti-blooming sensors are not recommended for applications requiring very low light or high accuracy measurements.
+                                                         */
+#define OMEGONPROCAM_OPTION_ANTI_BLOOMING_MAX      0x8c       /* [RO] Anti Blooming */
+#define OMEGONPROCAM_OPTION_CDS_MAX                0x8d       /* [RO] Correlated Double Sampling */
+#define OMEGONPROCAM_OPTION_SCANTYPE               0x8e       /* [RW] Scan Type: 0(areascan), 1(linescan) */
+#define OMEGONPROCAM_OPTION_OPERATIONMODE          0x8f       /* [RW] TDI Operation Mode: 1(area), 2(TDI) */
+#define OMEGONPROCAM_OPTION_TDITRIGGERMODE         0x90       /* [RW] TDI Trigger Mode: 1(normal), 2(both) */
+#define OMEGONPROCAM_OPTION_TDISTAGE               0x91       /* [RW] TDI Trigger Stage: sensor scan stage */
+#define OMEGONPROCAM_OPTION_FRAMEINTERVAL          0x92       /* [RW] Frame Interval in microseconds */
+#define OMEGONPROCAM_OPTION_FRAMEINTERVAL_MIN      0x93       /* [RO] Frame Interval, minimum */
+#define OMEGONPROCAM_OPTION_FRAMEINTERVAL_MAX      0x94       /* [RO] Frame Interval, maximum */
+#define OMEGONPROCAM_OPTION_IMAGEPTRRAW            0x95       /* [RW] default: 0 */
+#define OMEGONPROCAM_OPTION_IMAGEPTRBOTH           0x96       /* [RW] default: 0 */
+#define OMEGONPROCAM_OPTION_LDC                    0x97       /* [RW] Low Dark Current, 0 => disable, 1 => enable */
 
 /* pixel format */
 #define OMEGONPROCAM_PIXELFORMAT_RAW8              0x00
@@ -1191,6 +1340,8 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_feed_Pipe(HOmegonprocam h, unsigned pipe
 #define OMEGONPROCAM_PIXELFORMAT_HDR11HL           0x10   /* HDR, Bitdepth: 11, Conversion Gain: High + Low */
 #define OMEGONPROCAM_PIXELFORMAT_HDR12HL           0x11   /* HDR, Bitdepth: 12, Conversion Gain: High + Low */
 #define OMEGONPROCAM_PIXELFORMAT_HDR14HL           0x12   /* HDR, Bitdepth: 14, Conversion Gain: High + Low */
+#define OMEGONPROCAM_PIXELFORMAT_RAW10PACK         0x13
+#define OMEGONPROCAM_PIXELFORMAT_RAW14PACK         0x14
 
 /*
 * cmd: input
@@ -1204,12 +1355,11 @@ OMEGONPROCAM_API(HRESULT)     Omegonprocam_get_PixelFormatSupport(HOmegonprocam 
 * pixelFormat: OMEGONPROCAM_PIXELFORMAT_XXXX
 */
 OMEGONPROCAM_API(const char*) Omegonprocam_get_PixelFormatName(int pixelFormat);
-
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Option(HOmegonprocam h, unsigned iOption, int iValue);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Option(HOmegonprocam h, unsigned iOption, int* piValue);
+OMEGONPROCAM_API(int)         Omegonprocam_get_PixelFormatBitdepth(int pixelFormat);
 
 /*
     xOffset, yOffset, xWidth, yHeight: must be even numbers
+    Minimum width & height: 8
 */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Roi(HOmegonprocam h, unsigned xOffset, unsigned yOffset, unsigned xWidth, unsigned yHeight);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Roi(HOmegonprocam h, unsigned* pxOffset, unsigned* pyOffset, unsigned* pxWidth, unsigned* pyHeight);
@@ -1225,9 +1375,17 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Binning(HOmegonprocam h, const char*
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Binning(HOmegonprocam h, const char** ppValue, const char** ppMethod);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_BinningNumber(HOmegonprocam h);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_BinningValue(HOmegonprocam h, unsigned index, const char** ppValue);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_BinningMethod(HOmegonprocam h, unsigned index, const char** ppMethod);
 
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_XY(HOmegonprocam h, int x, int y);
+/*
+ const char* pStrMethod;
+ unsigned index = 0;
+ do {
+     if (FAILED(Omegonprocam_get_BinningMethod(h, index, &pStrMethod)))
+         break;
+     ++index;
+ } while (1);
+*/
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_BinningMethod(HOmegonprocam h, unsigned index, const char** ppMethod);
 
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_SUPPORTEDMODE            0x01 /* 0x01 => Input, 0x02 => Output, (0x01 | 0x02) => support both Input and Output */
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_GPIODIR                  0x03 /* 0x00 => Input, 0x01 => Output */
@@ -1258,16 +1416,16 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_XY(HOmegonprocam h, int x, int y);
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_TRIGGERSOURCE            0x0e
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_TRIGGERDELAY             0x0f /* Trigger delay time in microseconds, range: [0, 5000000] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_TRIGGERDELAY             0x10
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_BURSTCOUNTER             0x11 /* Burst Counter, range: [1 ~ 65535] */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_BURSTCOUNTER             0x11 /* Burst Counter, range: [1, 65535] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_BURSTCOUNTER             0x12
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_COUNTERSOURCE            0x13 /* 0x00 => Opto-isolated input, 0x01 => GPIO0, 0x02 => GPIO1 */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_COUNTERSOURCE            0x14
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_COUNTERVALUE             0x15 /* Counter Value, range: [1 ~ 65535] */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_COUNTERVALUE             0x15 /* Counter Value, range: [1, 65535] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_COUNTERVALUE             0x16
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_RESETCOUNTER             0x18
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_PWM_FREQ                 0x19 /* PWM Frequency */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_PWM_FREQ                 0x19 /* PWM Frequency, range: [0, 0xffffffff] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_PWM_FREQ                 0x1a
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_PWM_DUTYRATIO            0x1b /* PWM Duty Ratio */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_PWM_DUTYRATIO            0x1b /* PWM Duty Ratio, default: 50, range: [0, 100] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_PWM_DUTYRATIO            0x1c
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_PWMSOURCE                0x1d /* PWM Source: 0x00 => Opto-isolated input, 0x01 => GPIO0, 0x02 => GPIO1 */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_PWMSOURCE                0x1e
@@ -1300,23 +1458,23 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_XY(HOmegonprocam h, int x, int y);
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_UART_LINEMODE            0x2e
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_EXPO_ACTIVE_MODE         0x2f /* exposure time signal: 0 => specified line, 1 => common exposure time */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_EXPO_ACTIVE_MODE         0x30
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_EXPO_START_LINE          0x31 /* exposure start line, default: 0 */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_EXPO_START_LINE          0x31 /* exposure start line, default: 0, range: [0, 16384] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_EXPO_START_LINE          0x32
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_EXPO_END_LINE            0x33 /* exposure end line, default: 0
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_EXPO_END_LINE            0x33 /* exposure end line, default: 0, range: [0, 16384]
                                                                    end line must be no less than start line
                                                                 */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_EXPO_END_LINE            0x34
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_EXEVT_ACTIVE_MODE        0x35 /* exposure event: 0 => specified line, 1 => common exposure time */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_EXEVT_ACTIVE_MODE        0x36
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_OUTPUTCOUNTERVALUE       0x37 /* Output Counter Value, range: [0 ~ 65535] */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_OUTPUTCOUNTERVALUE       0x37 /* Output Counter Value, range: [0, 65535] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_OUTPUTCOUNTERVALUE       0x38
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_OUTPUT_PAUSE             0x3a /* Output pause: 1 => puase, 0 => unpause */
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_INPUT_STATE              0x3b /* Input state: 0 (low level) or 1 (high level) */
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_USER_PULSE_HIGH          0x3d /* User pulse high level time: us */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_USER_PULSE_HIGH          0x3d /* User pulse high level time: us, range: [0, 0xffffffff] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_USER_PULSE_HIGH          0x3e
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_USER_PULSE_LOW           0x3f /* User pulse low level time: us */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_USER_PULSE_LOW           0x3f /* User pulse low level time: us, range: [0, 0xffffffff] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_USER_PULSE_LOW           0x40
-#define OMEGONPROCAM_IOCONTROLTYPE_GET_USER_PULSE_NUMBER        0x41 /* User pulse number: default 0 */
+#define OMEGONPROCAM_IOCONTROLTYPE_GET_USER_PULSE_NUMBER        0x41 /* User pulse number: default 0, range: [0, 0xffffffff] */
 #define OMEGONPROCAM_IOCONTROLTYPE_SET_USER_PULSE_NUMBER        0x42
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_EXTERNAL_TRIGGER_NUMBER  0x43 /* External trigger number */
 #define OMEGONPROCAM_IOCONTROLTYPE_GET_DEBOUNCER_TRIGGER_NUMBER 0x45 /* Trigger signal number after debounce */
@@ -1347,6 +1505,7 @@ typedef struct {
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_SelfTrigger(HOmegonprocam h, const OmegonprocamSelfTrigger* pSt);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_SelfTrigger(HOmegonprocam h, OmegonprocamSelfTrigger* pSt);
 
+/* flash action */
 #define OMEGONPROCAM_FLASH_SIZE      0x00    /* query total size */
 #define OMEGONPROCAM_FLASH_EBLOCK    0x01    /* query erase block size */
 #define OMEGONPROCAM_FLASH_RWBLOCK   0x02    /* query read/write block size */
@@ -1354,19 +1513,45 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_SelfTrigger(HOmegonprocam h, Omegonp
 #define OMEGONPROCAM_FLASH_READ      0x04    /* read */
 #define OMEGONPROCAM_FLASH_WRITE     0x05    /* write */
 #define OMEGONPROCAM_FLASH_ERASE     0x06    /* erase */
-/* Flash:
- action = OMEGONPROCAM_FLASH_XXXX: read, write, erase, query total size, query read/write block size, query erase block size
+/* flash zone */
+#define OMEGONPROCAM_FLASH_SENSOR    0x00    /* sensor */
+#define OMEGONPROCAM_FLASH_USER      0x02    /* user */
+/*
+ action = (zone << 24) | OMEGONPROCAM_FLASH_XXXX: read, write, erase, query total size, query read/write block size, query erase block size
  addr = address
  see democpp
 */
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_rwc_Flash(HOmegonprocam h, unsigned action, unsigned addr, unsigned len, void* pData);
 
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_write_UART(HOmegonprocam h, const unsigned char* pData, unsigned nDataLen);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_read_UART(HOmegonprocam h, unsigned char* pBuffer, unsigned nBufferLen);
-
 /* Initialize support for GigE cameras. If online/offline notifications are not required, the callback function can be set to NULL */
 typedef void (__stdcall* POMEGONPROCAM_HOTPLUG)(void* ctxHotPlug);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_GigeEnable(POMEGONPROCAM_HOTPLUG funHotPlug, void* ctxHotPlug);
+
+/* opt: semicolon separated options:
+*        "wifi": Enable WiFi adapter support
+*/
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_GigeEnableV2(POMEGONPROCAM_HOTPLUG funHotPlug, void* ctxHotPlug, const char* opt);
+
+/* Initialize support for PCIe cameras. If online/offline notifications are not required, the callback function can be set to NULL */
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_PciEnable(POMEGONPROCAM_HOTPLUG funHotPlug, void* ctxHotPlug);
+
+/* Initialize support for *.cti cameras. If online/offline notifications are not required, the callback function can be set to NULL
+* (1) ctiPath = NULL means all *.cti in GENICAM_GENTL64_PATH/GENICAM_GENTL32_PATH
+* or
+* (2) ctiPath[] = {
+            "/full/path/to/file.cti",
+            ...,
+            NULLL      // Use NULL pointer to indicate the end of the array
+        }
+*/
+#if defined(_WIN32)
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_CtiEnable(POMEGONPROCAM_HOTPLUG funHotPlug, void* ctxHotPlug, const wchar_t* ctiPath[]);
+#else
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_CtiEnable(POMEGONPROCAM_HOTPLUG funHotPlug, void* ctxHotPlug, const char* ctiPath[]);
+#endif
+
+OMEGONPROCAM_API(HRESULT) Omegonprocam_readPtr(HOmegonprocam h, const char* key, int len, void* pData);
+OMEGONPROCAM_API(HRESULT) Omegonprocam_writePtr(HOmegonprocam h, const char* key, int len, const void* pData);
 
 /*
  filePath:
@@ -1391,21 +1576,10 @@ Recommendation: for better rubustness, when notify of device insertion arrives, 
 OMEGONPROCAM_API(void)   Omegonprocam_HotPlug(POMEGONPROCAM_HOTPLUG funHotPlug, void* ctxHotPlug);
 #endif
 
-OMEGONPROCAM_API(unsigned) Omegonprocam_EnumWithName(OmegonprocamDeviceV2 pti[OMEGONPROCAM_MAX]);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_set_Name(HOmegonprocam h, const char* name);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_query_Name(HOmegonprocam h, char name[64]);
-#if defined(_WIN32)
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Name(const wchar_t* camId, const char* name);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Name(const wchar_t* camId, char name[64]);
-#else
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Name(const char* camId, const char* name);
-OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Name(const char* camId, char name[64]);
-#endif
-
 typedef struct {
     unsigned short lensID;
     unsigned char  lensType;
-    unsigned char  statusAfmf;      /* LENS_AF = 0x00,  LENS_MF = 0x80 */
+    unsigned char  statusAfmf;      /* LENS_AF = 0x00, LENS_MF = 0x80 */
 
     unsigned short maxFocalLength;
     unsigned short curFocalLength;
@@ -1479,15 +1653,35 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_AFFMPos(HOmegonprocam h, int iFMPos)
 */
 #if defined(_WIN32)
 OMEGONPROCAM_API(HRESULT) Omegonprocam_Replug(const wchar_t* camId);
+OMEGONPROCAM_API(HRESULT) Omegonprocam_Reset(const wchar_t* camId);
 OMEGONPROCAM_API(HRESULT) Omegonprocam_Enable(const wchar_t* camId, int enable); /* 1 => enable, 0 => disable */
 #else
 OMEGONPROCAM_API(HRESULT) Omegonprocam_Replug(const char* camId);
+OMEGONPROCAM_API(HRESULT) Omegonprocam_Reset(const char* camId);
 OMEGONPROCAM_API(HRESULT) Omegonprocam_Enable(const char* camId, int enable); /* 1 => enable, 0 => disable */
 #endif
 
 OMEGONPROCAM_API(const OmegonprocamModelV2**) Omegonprocam_all_Model(); /* return all supported USB model array */
 OMEGONPROCAM_API(const OmegonprocamModelV2*) Omegonprocam_query_Model(HOmegonprocam h);
 OMEGONPROCAM_API(const OmegonprocamModelV2*) Omegonprocam_get_Model(unsigned short idVendor, unsigned short idProduct);
+
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_XY(HOmegonprocam h, int x, int y);
+
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_write_UART(HOmegonprocam h, const unsigned char* pData, unsigned nDataLen);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_read_UART(HOmegonprocam h, unsigned char* pBuffer, unsigned nBufferLen);
+
+OMEGONPROCAM_API(unsigned) Omegonprocam_EnumWithName(OmegonprocamDeviceV2 pti[OMEGONPROCAM_MAX]);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_set_Name(HOmegonprocam h, const char* name);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_query_Name(HOmegonprocam h, char name[64]);
+#if defined(_WIN32)
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Name(const wchar_t* camId, const char* name);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Name(const wchar_t* camId, char name[64]);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_query_SerialNumber(const wchar_t* camId, char sn[32]);
+#else
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_Name(const char* camId, const char* name);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_Name(const char* camId, char name[64]);
+OMEGONPROCAM_API(HRESULT)  Omegonprocam_query_SerialNumber(const char* camId, char sn[32]);
+#endif
 
 /* firmware update:
     camId: camera ID
@@ -1577,7 +1771,6 @@ OMEGONPROCAM_API(double)   Omegonprocam_calc_ClarityFactorV2(const void* pImageD
 */
 OMEGONPROCAM_API(void)     Omegonprocam_deBayerV2(unsigned nFourCC, int nW, int nH, const void* pRaw, void* pRGB, unsigned char nBitDepth, unsigned char nBitCount);
 
-
 #ifndef __OMEGONPROCAMFOCUSMOTOR_DEFINED__
 #define __OMEGONPROCAMFOCUSMOTOR_DEFINED__
 typedef struct {
@@ -1654,8 +1847,7 @@ typedef POMEGONPROCAM_DATA_CALLBACK_V3 POMEGONPROCAM_DATA_CALLBACK_V2;
 OMEGONPROCAM_DEPRECATED
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_StartPushModeV2(HOmegonprocam h, POMEGONPROCAM_DATA_CALLBACK_V2 funData, void* ctxData);
 
-#if !defined(_WIN32)
-#ifndef __BITMAPINFOHEADER_DEFINED__
+#if !(defined(_WIN32) || defined(__BITMAPINFOHEADER_DEFINED__))
 #define __BITMAPINFOHEADER_DEFINED__
 typedef struct {
     unsigned        biSize;
@@ -1670,7 +1862,6 @@ typedef struct {
     unsigned        biClrUsed;
     unsigned        biClrImportant;
 } BITMAPINFOHEADER;
-#endif
 #endif
 
 typedef void (__stdcall* POMEGONPROCAM_DATA_CALLBACK)(const void* pData, const BITMAPINFOHEADER* pHeader, int bSnap, void* ctxData);
@@ -1736,7 +1927,7 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_VignetAmountInt(HOmegonprocam h, int
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_put_VignetMidPointInt(HOmegonprocam h, int nMidPoint);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_get_VignetMidPointInt(HOmegonprocam h, int* nMidPoint);
 
-/* obsolete flags */
+/* obsolete pixel format alias */
 #define OMEGONPROCAM_FLAG_BITDEPTH10    OMEGONPROCAM_FLAG_RAW10  /* pixel format, RAW 10bits */
 #define OMEGONPROCAM_FLAG_BITDEPTH12    OMEGONPROCAM_FLAG_RAW12  /* pixel format, RAW 12bits */
 #define OMEGONPROCAM_FLAG_BITDEPTH14    OMEGONPROCAM_FLAG_RAW14  /* pixel format, RAW 14bits */
@@ -1750,6 +1941,16 @@ OMEGONPROCAM_API(HRESULT)  Omegonprocam_log_File(const
 #endif
                                        filePath);
 OMEGONPROCAM_API(HRESULT)  Omegonprocam_log_Level(unsigned level); /* 0 => none; 1 => error; 2 => debug; 3 => verbose */
+OMEGONPROCAM_API(void)     Omegonprocam_log_str(unsigned level, const char* str);
+OMEGONPROCAM_APIV(void)    Omegonprocam_log(unsigned level, const char* format, ...);
+
+#if defined(OMEGONPROCAM_LOG)
+#define OMEGONPROCAM_LOG_NONE(format, ...)     Omegonprocam_log(0, format, ##__VA_ARGS__)
+#define OMEGONPROCAM_LOG_ERROR(format, ...)    Omegonprocam_log(1, format, ##__VA_ARGS__)
+#define OMEGONPROCAM_LOG_DEBUG(format, ...)    Omegonprocam_log(2, format, ##__VA_ARGS__)
+#define OMEGONPROCAM_LOG_VERBOSE(format, ...)  Omegonprocam_log(3, format, ##__VA_ARGS__)
+/* for example: OMEGONPROCAM_LOG_DEBUG("%s: blahblah, x = %d, y = %f", __func__ x, y); */
+#endif
 
 #if defined(_WIN32)
 #pragma pack(pop)

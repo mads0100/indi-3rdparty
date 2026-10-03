@@ -34,11 +34,12 @@
 #include <fstream>
 #include <iostream>
 #include <regex>
+#include <vector>
 
 #include <limits.h>
 
 
-#define READ_TIMEOUT 5
+#define READ_TIMEOUT 20
 
 /******************************************************************/
 /* PUBLIC MEMBERS                                                */
@@ -332,12 +333,12 @@ bool CloudWatcherController::checkCloudWatcher() // CW Internal Name Cmd: A! (pu
         return false;
     }
 
-    std::string internalNameBlock = "!N CloudWatcher!";
-    std::string pocketNameBlock = "!N PocketCW!";
     std::string detectedName = std::string(inputBuffer);
-    LOGF_DEBUG( "Detected name is %s", detectedName.c_str());
+    LOGF_DEBUG("Detected name is %s", detectedName.c_str());
 
-    return (detectedName == internalNameBlock || detectedName == pocketNameBlock);
+    // Use regex to match either CloudWatcher or PocketCW, ignoring whitespace padding
+    std::regex pattern("!N\\s*(CloudWatcher|PocketCW)\\s*!");
+    return std::regex_search(detectedName, pattern);
 }
 
 // N.B. Document Rs232_Comms_v130.pdf updates the information in Rs232_Comms_v100.pdf (code below reflects latest update)
@@ -1198,14 +1199,14 @@ float CloudWatcherController::aggregateFloats(float values[], int numberOfValues
 
 int CloudWatcherController::aggregateInts(int values[], int numberOfValues)
 {
-    float newValues[numberOfValues];
+    std::vector<float> newValues(numberOfValues);
 
     for (int i = 0; i < numberOfValues; i++)
     {
         newValues[i] = (float)values[i];
     }
 
-    return (int)aggregateFloats(newValues, numberOfValues);
+    return (int)aggregateFloats(newValues.data(), numberOfValues);
 }
 
 void CloudWatcherController::trimString(char *str)

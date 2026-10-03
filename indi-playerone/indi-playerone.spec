@@ -74,6 +74,19 @@ make DESTDIR=%{buildroot} install
 %{_datadir}/indi
 
 %changelog
+* Wed Aug 12 2026 Hiroshi Saito <hiro3110g@gmail.com>
+- Available exposure change during video streaming
+- Refactor with thin, type-safe C++ wrapper for C SDK
+* Sun Aug 9 2026 Hiroshi Saito <hiro3110g@gmail.com>
+- BugFix: Error handling of getImageData()/getExposure()
+- Replace usleep() to wait_for()
+* Sat Jan 24 2026 Hiroshi Saito <hiro3110g@gmail.com>
+- Update PlayerOneCamera SDK to v3.10.0
+- Update PlayerOnePW SDK to v1.2.3
+* Sat Nov 15 2025 Hiroshi Saito <hiro3110g@gmail.com>
+- Update PlayerOneCamera SDK to v3.9.1
+* Fri Sep 5 2025 Hiroshi Saito <hiro3110g@gmail.com>
+- Update PlayerOneCamera SDK to v3.9.0
 * Sat Apr 5 2025 Hiroshi Saito <hiro3110g@gmail.com>
 - Update PlayerOneCamera SDK to v3.8.1
 - Update PlayerOnePW SDK to v1.2.2

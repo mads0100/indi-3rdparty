@@ -32,11 +32,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <new>
 #include <vector>
 #include <map>
 #include <unistd.h>
-
-#define USE_POA_EXP     // since SDK v3.8.0: change time unit of exposure from micor second to second
+#include <thread>
+#include <chrono>
 
 #define MAX_EXP_RETRIES         3
 #define VERBOSE_EXPOSURE        3
@@ -56,43 +58,37 @@ const char *POABase::getBayerString() const
 void POABase::workerStreamVideo(const std::atomic_bool &isAbortToQuit)
 {
     POAErrors ret;
-    double ExposureRequest = 1.0 / Streamer->getTargetFPS();
-    POAConfigValue confVal;
-#ifdef USE_POA_EXP
-    confVal.floatValue = static_cast<double>(ExposureRequest * 0.95);
-
-    ret = POASetConfig(mCameraInfo.cameraID, POA_EXP, confVal, POA_FALSE);
-#else
-    confVal.intValue = static_cast<long>(ExposureRequest * 950000.0);
-
-    ret = POASetConfig(mCameraInfo.cameraID, POA_EXPOSURE, confVal, POA_FALSE);
-#endif
+    double lastExposure = mStreamExposureS.load(std::memory_order_relaxed);
+    double expoS = static_cast<double>(lastExposure * 0.95);
+ 
+    ret = Helpers::SetConfig(mCameraInfo.cameraID, POA_EXP, expoS, POA_FALSE);
     if (ret != POA_OK)
+    {
         LOGF_ERROR("Failed to set exposure duration (%s).", Helpers::toString(ret));
+        return;
+    }
 
-    // start video exposure
-    ret = POAStartExposure(mCameraInfo.cameraID, POA_FALSE);
+    ret = POAStartExposure(mCameraInfo.cameraID, POA_FALSE);    // start video exposure
     if (ret != POA_OK)
     {
         LOGF_ERROR("Failed to start video capture (%s).", Helpers::toString(ret));
+        return;
     }
 
     uint8_t *targetFrame = PrimaryCCD.getFrameBuffer();
     uint32_t totalBytes  = PrimaryCCD.getFrameBufferSize();
-    int waitMS           = static_cast<int>((ExposureRequest * 1000.0) + 500);
+    int waitMS           = static_cast<int>((lastExposure * 1000.0) + 500);
+    double currentExposure;
+
+    if (targetFrame == nullptr || totalBytes == 0)
+    {
+        LOGF_ERROR("Invalid video frame buffer: address=%p, size=%u.", targetFrame, totalBytes);
+        POAStopExposure(mCameraInfo.cameraID);
+        return;
+    }
 
     while (!isAbortToQuit)
     {
-        POABool pIsReady = POA_FALSE;
-        while (pIsReady == POA_FALSE)
-        {
-            //if (isAbortToQuit) //Triggered by external conditions
-            //    break;
-
-            //usleep(ExposureRequest / 10);
-            POAImageReady(mCameraInfo.cameraID, &pIsReady);
-        }
-
         ret = POAGetImageData(mCameraInfo.cameraID, targetFrame, totalBytes, waitMS);
         if (ret != POA_OK)
         {
@@ -103,8 +99,26 @@ void POABase::workerStreamVideo(const std::atomic_bool &isAbortToQuit)
                 break;
             }
 
-            usleep(100);
+            std::unique_lock<std::mutex> waitLock(mExposureMutex);
+            mExposureWakeup.wait_for(waitLock, std::chrono::milliseconds(100), [&isAbortToQuit](){ return isAbortToQuit.load(); });
             continue;
+        }
+
+        currentExposure = mStreamExposureS.load(std::memory_order_relaxed);
+        if (currentExposure != lastExposure)
+        {
+            expoS = static_cast<double>(currentExposure * 0.95);
+            ret = Helpers::SetConfig(mCameraInfo.cameraID, POA_EXP, expoS, POA_FALSE);
+            if (ret != POA_OK)
+            {
+                LOGF_ERROR("Failed to update exposure (%s).", Helpers::toString(ret));
+            }
+            else
+            {
+                LOGF_INFO("Streaming exposure updated: %.5f", currentExposure);
+                waitMS = static_cast<int>((currentExposure * 1000.0) + 500);
+                lastExposure = currentExposure;
+            }
         }
 
         if (mCurrentVideoFormat == POA_RGB24)
@@ -124,23 +138,14 @@ void POABase::workerBlinkExposure(const std::atomic_bool &isAbortToQuit, int bli
         return;
 
     POAErrors ret;
-    POAConfigValue confVal;
-#ifdef USE_POA_EXP
-    confVal.floatValue = (double)duration;
+    double expoS = static_cast<double>(duration);
 
     LOGF_DEBUG("Blinking %ld time(s) before exposure.", blinks);
 
-    ret = POASetConfig(mCameraInfo.cameraID, POA_EXP, confVal, POA_FALSE);
-#else
-    confVal.intValue = duration * 1000 * 1000;
-
-    LOGF_DEBUG("Blinking %ld time(s) before exposure.", blinks);
-
-    ret = POASetConfig(mCameraInfo.cameraID, POA_EXPOSURE, confVal, POA_FALSE);
-#endif
+    ret = Helpers::SetConfig(mCameraInfo.cameraID, POA_EXP, expoS, POA_FALSE);
     if (ret != POA_OK)
     {
-        LOGF_ERROR("Failed to set blink exposure to %ldus (%s).", confVal.intValue, Helpers::toString(ret));
+        LOGF_ERROR("Failed to set blink exposure to %.6fs (%s).", expoS, Helpers::toString(ret));
         return;
     }
 
@@ -160,15 +165,17 @@ void POABase::workerBlinkExposure(const std::atomic_bool &isAbortToQuit, int bli
             if (isAbortToQuit)
                 return;
 
-            usleep(100 * 1000);
+            std::unique_lock<std::mutex> stateLock(mExposureMutex);
+            mExposureWakeup.wait_for(stateLock, std::chrono::milliseconds(100), [&isAbortToQuit](){ return isAbortToQuit.load(); });
+
             ret = POAGetCameraState(mCameraInfo.cameraID, &status);
         }
         while (ret == POA_OK && status == STATE_EXPOSING);
 
-        POABool pIsReady;
-        POAImageReady(mCameraInfo.cameraID, &pIsReady);
+        POABool isReady = POA_FALSE;
+        ret = POAImageReady(mCameraInfo.cameraID, &isReady);
 
-        if (!pIsReady)
+        if (!isReady)
         {
             LOGF_ERROR("Blink exposure failed, status %d (%s).", status, Helpers::toString(ret));
             LOGF_ERROR("Blink exposure failed (%s).", Helpers::toString(ret));
@@ -178,15 +185,12 @@ void POABase::workerBlinkExposure(const std::atomic_bool &isAbortToQuit, int bli
     while (--blinks > 0);
 
     if (blinks > 0)
-    {
         LOGF_WARN("%ld blink exposure(s) NOT done.", blinks);
-    }
 }
 
 void POABase::workerExposure(const std::atomic_bool &isAbortToQuit, float duration)
 {
     POAErrors ret;
-    POAConfigValue confVal;
 
     workerBlinkExposure(
         isAbortToQuit,
@@ -196,40 +200,32 @@ void POABase::workerExposure(const std::atomic_bool &isAbortToQuit, float durati
 
     PrimaryCCD.setExposureDuration(duration);
 
-    LOGF_DEBUG("StartExposure->setexp : %.3fs", duration);
-
-#ifdef USE_POA_EXP
-    confVal.floatValue = (double)(duration);
-    ret = POASetConfig(mCameraInfo.cameraID, POA_EXP, confVal, POA_FALSE);
-#else
-    confVal.intValue = (long)(duration * 1000 * 1000);
-    ret = POASetConfig(mCameraInfo.cameraID, POA_EXPOSURE, confVal, POA_FALSE);
-#endif
-    if (ret != POA_OK)
+    LOGF_INFO("StartExposure->setexp : %.3fs", duration);
+    ret = Helpers::SetConfig(mCameraInfo.cameraID, POA_EXP, static_cast<double>(duration), POA_FALSE);
+    if(ret != POA_OK)
     {
-        LOGF_ERROR("Failed to set exposure duration (%s).", Helpers::toString(ret));
+        LOGF_ERROR("Failed to set exposure duration (%s)", Helpers::toString(ret));
+        return;
     }
 
-    // Try exposure for 3 times
-    // isDark is for mechanical shutter control
-    // However, PlayerOne Cameras doesn't have mechanical shutter
-    //POABool isDark = (PrimaryCCD.getFrameType() == INDI::CCDChip::DARK_FRAME) ? POA_TRUE : POA_FALSE;
-
-    for (int i = 0; i < 3; i++)
+    // Try exposure for MAX_EXP_RETRIES times
+    for (int i = 0; i < MAX_EXP_RETRIES; i++)
     {
-        //ret = POAStartExposure(mCameraInfo.cameraID, isDark);
-        ret = POAStartExposure(mCameraInfo.cameraID, POA_TRUE);
+        ret = POAStartExposure(mCameraInfo.cameraID, POA_TRUE); // one shot exposure
+
         if (ret == POA_OK)
             break;
 
-        LOGF_ERROR("Failed to start exposure (%s)", Helpers::toString(ret));
-        // Wait 100ms before trying again
-        usleep(100 * 1000);
+        LOGF_WARN("Failed to start exposure, next try (%d)/%d", i, MAX_EXP_RETRIES);
+        std::unique_lock<std::mutex> retryLock(mExposureMutex);
+        mExposureWakeup.wait_for(retryLock, std::chrono::milliseconds(100), [&isAbortToQuit](){ return isAbortToQuit.load(); });
+        if (isAbortToQuit)
+            return;
     }
 
     if (ret != POA_OK)
     {
-        LOG_WARN("PlayerOne firmware might require an update to *compatible mode.");
+        LOGF_ERROR("Failed to start exposure after %d try", MAX_EXP_RETRIES);
         return;
     }
 
@@ -238,79 +234,39 @@ void POABase::workerExposure(const std::atomic_bool &isAbortToQuit, float durati
     if (duration > VERBOSE_EXPOSURE)
         LOGF_INFO("Taking a %g seconds frame...", duration);
 
-    int statRetry = 0;
-    POACameraState status;
-    POABool pIsReady;
-    do
+    const auto longDelay   = std::chrono::milliseconds(1000);
+    const auto mediumDelay = std::chrono::milliseconds(100);
+    const auto shortDelay  = std::chrono::milliseconds(1);
+
+    float timeLeft;
+
+    std::unique_lock<std::mutex> lock(mExposureMutex);
+
+    POABool isReady = POA_FALSE;
+    while (!isAbortToQuit)
     {
-        float delay = 0.1;
-        float timeLeft = std::max(duration - exposureTimer.elapsed() / 1000.0, 0.0);
+        isReady = POA_FALSE;
+        ret = POAImageReady(mCameraInfo.cameraID , &isReady);
+        if (ret == POA_OK && isReady == POA_TRUE)
+            break;
 
-        /*
-         * Check the status every second until the time left is
-         * about one second, after which decrease the poll interval
-         *
-         * For expsoures with more than a second left try
-         * to keep the displayed "exposure left" value at
-         * a full second boundary, which keeps the
-         * count down neat
-         */
-        if (timeLeft > 1.1)
-        {
-            delay = std::max(timeLeft - std::trunc(timeLeft), 0.005f);
-            timeLeft = std::round(timeLeft);
-        }
-
+        timeLeft = std::max(duration - exposureTimer.elapsed() / 1000.0, 0.0);
         if (timeLeft > 0)
-        {
             PrimaryCCD.setExposureLeft(timeLeft);
-        }
 
-        usleep(delay * 1000 * 1000);
-
-        POAErrors ret = POAGetCameraState(mCameraInfo.cameraID, &status);
-
-        if (isAbortToQuit)
-            return;
-
-        if (ret != POA_OK)
-        {
-            LOGF_DEBUG("Failed to get exposure status (%s)", Helpers::toString(ret));
-            if (++statRetry < 10)
-            {
-                usleep(100);
-                continue;
-            }
-
-            LOGF_ERROR("Exposure status timed out (%s)", Helpers::toString(ret));
-            PrimaryCCD.setExposureFailed();
-            return;
-        }
-
-        if (ret == POA_ERROR_EXPOSURE_FAILED)
-        {
-            if (++mExposureRetry < MAX_EXP_RETRIES)
-            {
-                LOG_DEBUG("POA_ERROR_EXPOSURE_FAILED. Restarting exposure...");
-                POAStopExposure(mCameraInfo.cameraID);
-                workerExposure(isAbortToQuit, duration);
-                return;
-            }
-
-            LOGF_ERROR("Exposure failed after %d attempts.", mExposureRetry);
-            POAStopExposure(mCameraInfo.cameraID);
-            PrimaryCCD.setExposureFailed();
-            return;
-        }
-
-        POAImageReady(mCameraInfo.cameraID, &pIsReady);
+        if (timeLeft > 1.1)
+            mExposureWakeup.wait_for(lock, longDelay, [&isAbortToQuit](){ return isAbortToQuit.load(); });
+        else if (timeLeft > 0.2)
+            mExposureWakeup.wait_for(lock, mediumDelay, [&isAbortToQuit](){ return isAbortToQuit.load(); });
+        else
+            mExposureWakeup.wait_for(lock, shortDelay, [&isAbortToQuit](){ return isAbortToQuit.load(); });
     }
-    while (!pIsReady);
 
-    // Reset exposure retry
-    mExposureRetry = 0;
+    if (isAbortToQuit)
+        return;
+
     PrimaryCCD.setExposureLeft(0.0);
-    if (PrimaryCCD.getExposureDuration() > 3)
+    if (PrimaryCCD.getExposureDuration() > VERBOSE_EXPOSURE)
         LOG_INFO("Exposure done, downloading image...");
 
     grabImage(duration);
@@ -501,9 +457,7 @@ bool POABase::updateProperties()
             defineProperty(NicknameTP);
         }
         if (!SensorModeSP.isEmpty())
-        {
             defineProperty(SensorModeSP);
-        }
     }
     else
     {
@@ -522,9 +476,7 @@ bool POABase::updateProperties()
             deleteProperty(ControlSP);
 
         if (hasFlipControl())
-        {
             deleteProperty(FlipSP);
-        }
 
         if (!VideoFormatSP.isEmpty())
             deleteProperty(VideoFormatSP);
@@ -539,9 +491,7 @@ bool POABase::updateProperties()
         deleteProperty(ADCDepthNP);
 
         if (!SensorModeSP.isEmpty())
-        {
             deleteProperty(SensorModeSP);
-        }
     }
 
     return true;
@@ -552,7 +502,6 @@ bool POABase::Connect()
     LOGF_DEBUG("Attempting to open %s...", mCameraName.c_str());
 
     POAErrors ret = POA_OK;
-    POAConfigValue confVal;
 
     if (isSimulation() == false)
         ret = POAOpenCamera(mCameraInfo.cameraID);
@@ -576,8 +525,8 @@ bool POABase::Connect()
     mTimerTemperature.start(TEMP_TIMER_MS);
 
     LOG_INFO("Setting intital bandwidth to AUTO on connection.");
-    confVal.intValue = 40;
-    if ((ret = POASetConfig(mCameraInfo.cameraID, POA_USB_BANDWIDTH_LIMIT, confVal, POA_FALSE)) != POA_OK)
+    long bandwidth = 40;
+    if ((ret = Helpers::SetConfig(mCameraInfo.cameraID, POA_USB_BANDWIDTH_LIMIT, bandwidth, POA_FALSE)) != POA_OK)
     {
         LOGF_ERROR("Failed to set initial bandwidth (%s).", Helpers::toString(ret));
     }
@@ -664,9 +613,8 @@ void POABase::setupParams()
         {
             LOGF_DEBUG("setupParams->set USB %d", pCtrlCaps.minValue.intValue);
 
-            POAConfigValue confVal;
-            confVal.intValue = pCtrlCaps.minValue.intValue;
-            POASetConfig(mCameraInfo.cameraID, POA_USB_BANDWIDTH_LIMIT, confVal, POA_FALSE);
+            long bandwidth = pCtrlCaps.minValue.intValue;
+            Helpers::SetConfig(mCameraInfo.cameraID, POA_USB_BANDWIDTH_LIMIT, bandwidth, POA_FALSE);
             break;
         }
     }
@@ -752,15 +700,13 @@ void POABase::setupParams()
     int nbuf = PrimaryCCD.getXRes() * PrimaryCCD.getYRes() * PrimaryCCD.getBPP() / 8;
     PrimaryCCD.setFrameBufferSize(nbuf);
 
-    POAConfigValue confVal;
-    confVal.floatValue = 0.0;
-    POABool isAuto = POA_FALSE;
+    long temp = 0;
 
-    ret = POAGetConfig(mCameraInfo.cameraID, POA_TEMPERATURE, &confVal, &isAuto);
+    ret = Helpers::GetConfig(mCameraInfo.cameraID, POA_TEMPERATURE, temp);
     if (ret != POA_OK)
         LOGF_DEBUG("Failed to get temperature (%s).", Helpers::toString(ret));
 
-    TemperatureNP[0].setValue(confVal.floatValue);
+    TemperatureNP[0].setValue(temp);
     TemperatureNP.apply();
     LOGF_INFO("The CCD Temperature is %.3f.", TemperatureNP[0].getValue());
 
@@ -804,9 +750,8 @@ bool POABase::ISNewNumber(const char *dev, const char *name, double values[], ch
 
                 LOGF_DEBUG("Setting %s=%.2f...", ControlNP[i].getLabel(), ControlNP[i].getValue());
 
-                POAConfigValue confVal;
-                confVal.intValue = static_cast<long>(ControlNP[i].getValue());
-                ret = POASetConfig(mCameraInfo.cameraID, numCtrlCap->configID, confVal, POA_FALSE);
+                long value = static_cast<long>(ControlNP[i].getValue());
+                ret = Helpers::SetConfig(mCameraInfo.cameraID, numCtrlCap->configID, value, POA_FALSE);
 
                 if (ret != POA_OK)
                 {
@@ -848,7 +793,15 @@ bool POABase::ISNewNumber(const char *dev, const char *name, double values[], ch
         }
     }
 
-    return INDI::CCD::ISNewNumber(dev, name, values, names, n);
+    // Apply STREAMING_EXPOSURE (and everything else) in the base class first,
+    // then publish the new target exposure for the streaming worker thread.
+    const bool result = INDI::CCD::ISNewNumber(dev, name, values, names, n);
+
+    if (Streamer && dev != nullptr && !strcmp(dev, getDeviceName()) &&
+            name != nullptr && !strcmp(name, "STREAMING_EXPOSURE"))
+        mStreamExposureS.store(Streamer->getTargetExposure(), std::memory_order_relaxed);
+
+    return result;
 }
 
 bool POABase::ISNewSwitch(const char *dev, const char *name, ISState *states, char *names[], int n)
@@ -878,9 +831,8 @@ bool POABase::ISNewSwitch(const char *dev, const char *name, ISState *states, ch
 
                     LOGF_DEBUG("Setting %s=%.2f...", num.label, num.value);
 
-                    POAConfigValue confVal;
-                    confVal.intValue = num.value;
-                    POAErrors ret = POASetConfig(mCameraInfo.cameraID, numCtrlCap->configID, confVal, swAuto);
+                    long value = num.value;
+                    POAErrors ret = Helpers::SetConfig(mCameraInfo.cameraID, numCtrlCap->configID, value, swAuto);
                     if (ret != POA_OK)
                     {
                         LOGF_ERROR("Failed to set %s=%g (%s).", num.name, num.value, Helpers::toString(ret));
@@ -913,24 +865,18 @@ bool POABase::ISNewSwitch(const char *dev, const char *name, ISState *states, ch
             if (FlipSP[FLIP_HORIZONTAL].getState() == ISS_ON)
             {
                 if (FlipSP[FLIP_VERTICAL].getState() == ISS_ON)
-                {
                     flip = POA_FLIP_BOTH;
-                }
                 else
-                {
                     flip = POA_FLIP_HORI;
-                }
             }
             else
             {
                 if (FlipSP[FLIP_VERTICAL].getState() == ISS_ON)
-                {
                     flip = POA_FLIP_VERT;
-                }
             }
 
-            POAConfigValue confVal; // confValue will be ignored by POASetConfig()
-            POAErrors ret = POASetConfig(mCameraInfo.cameraID, flip, confVal, POA_FALSE);
+            POABool value = POA_TRUE; // value will be ignored by SetConfig()
+            POAErrors ret = Helpers::SetConfig(mCameraInfo.cameraID, flip, value, POA_FALSE);
             if (ret != POA_OK)
             {
                 LOGF_ERROR("Failed to set POA_FLIP=%d (%s).", flip, Helpers::toString(ret));
@@ -941,7 +887,7 @@ bool POABase::ISNewSwitch(const char *dev, const char *name, ISState *states, ch
 
             // Compensate bayer pattern (effective for RAW data format)
             char bayer[5];
-            POABayerCompensationByFlip(flip, bayer);
+            POABayerCompensationByFlip(flip, bayer, sizeof(bayer));
             BayerTP[2].setText(bayer);
 
             FlipSP.setState(IPS_OK);
@@ -1059,10 +1005,9 @@ int POABase::SetTemperature(double temperature)
     }
 
     POAErrors ret;
-    POAConfigValue confVal;
+    long temp = static_cast<long>(std::round(temperature));
 
-    confVal.intValue = std::round(temperature);
-    ret = POASetConfig(mCameraInfo.cameraID, POA_TARGET_TEMP, confVal, POA_TRUE);
+    ret = Helpers::SetConfig(mCameraInfo.cameraID, POA_TARGET_TEMP, temp, POA_TRUE);
     if (ret != POA_OK)
     {
         LOGF_ERROR("Failed to set temperature (%s).", Helpers::toString(ret));
@@ -1077,10 +1022,8 @@ int POABase::SetTemperature(double temperature)
 
 bool POABase::activateCooler(bool enable)
 {
-    POAConfigValue confVal;
-
-    confVal.boolValue = enable ? POA_TRUE : POA_FALSE;
-    POAErrors ret = POASetConfig(mCameraInfo.cameraID, POA_COOLER, confVal, POA_FALSE);
+    POABool value = enable ? POA_TRUE : POA_FALSE;
+    POAErrors ret = Helpers::SetConfig(mCameraInfo.cameraID, POA_COOLER, value, POA_FALSE);
     if (ret != POA_OK)
     {
         CoolerSP.setState(IPS_ALERT);
@@ -1109,6 +1052,7 @@ bool POABase::AbortExposure()
     LOG_DEBUG("Aborting exposure...");
 
     mWorker.quit();
+    mExposureWakeup.notify_all();
 
     POAStopExposure(mCameraInfo.cameraID);
     return true;
@@ -1141,6 +1085,8 @@ bool POABase::StartStreaming()
         }
     }
 #endif
+    // Seed the worker's exposure snapshot in case STREAMING_EXPOSURE was never set by the client.
+    mStreamExposureS.store(Streamer->getTargetExposure(), std::memory_order_relaxed);
     mWorker.start(std::bind(&POABase::workerStreamVideo, this, std::placeholders::_1));
     return true;
 }
@@ -1148,6 +1094,9 @@ bool POABase::StartStreaming()
 bool POABase::StopStreaming()
 {
     mWorker.quit();
+    mExposureWakeup.notify_all();
+
+    POAStopExposure(mCameraInfo.cameraID);
     return true;
 }
 
@@ -1165,6 +1114,7 @@ bool POABase::UpdateCCDFrame(int x, int y, int w, int h)
         LOGF_INFO("Invalid width request %d", w);
         return false;
     }
+
     if (subH > static_cast<uint32_t>(PrimaryCCD.getYRes() / binY))
     {
         LOGF_INFO("Invalid height request %d", h);
@@ -1179,6 +1129,7 @@ bool POABase::UpdateCCDFrame(int x, int y, int w, int h)
         LOGF_INFO("Incompatible frame width %dpx. Reducing by %dpx.", subW, subW % 4);
         warn_roi_width = false;
     }
+
     if (warn_roi_height && subH % 2 > 0)
     {
         LOGF_INFO("Incompatible frame height %dpx. Reducing by %dpx.", subH, subH % 2);
@@ -1236,13 +1187,14 @@ bool POABase::UpdateCCDBin(int binx, int biny)
  N.B. No processing is done on the image */
 int POABase::grabImage(float duration)
 {
-    POAErrors ret = POA_OK;
+    POAErrors ret;
 
     POAImgFormat type = getImageType();
 
     std::unique_lock<std::mutex> guard(ccdBufferLock);
     uint8_t *image = PrimaryCCD.getFrameBuffer();
     uint8_t *buffer = image;
+    std::unique_ptr<uint8_t[]> bufferOwner;
 
     uint16_t subW = PrimaryCCD.getSubW() / PrimaryCCD.getBinX();
     uint16_t subH = PrimaryCCD.getSubH() / PrimaryCCD.getBinY();
@@ -1251,23 +1203,32 @@ int POABase::grabImage(float duration)
 
     if (type == POA_RGB24)
     {
-        buffer = static_cast<uint8_t *>(malloc(nTotalBytes));
+        bufferOwner.reset(new (std::nothrow) uint8_t[nTotalBytes]);
+        buffer = bufferOwner.get();
         if (buffer == nullptr)
         {
-            LOGF_ERROR("%s: %d malloc failed (RGB 24).", getDeviceName());
+            LOGF_ERROR("%s: malloc failed (RGB 24).", getDeviceName());
             return -1;
         }
     }
 
-    ret = POAGetImageData(mCameraInfo.cameraID, buffer, nTotalBytes, -1);
+    double expoS = 0.0;
+
+    ret = Helpers::GetConfig(mCameraInfo.cameraID, POA_EXP, expoS);
+    if(ret != POA_OK || expoS < 0.0)
+    {
+        LOGF_ERROR("Failed to get exposure (%s).", Helpers::toString(ret));
+        return -1;
+    }
+
+    int waitMs = static_cast<int>(expoS * 1000 + 500);
+    ret = POAGetImageData(mCameraInfo.cameraID, buffer, nTotalBytes, waitMs);
     if (ret != POA_OK)
     {
         LOGF_ERROR(
             "Failed to get data after exposure (%dx%d #%d channels) (%s).",
             subW, subH, nChannels, Helpers::toString(ret)
         );
-        if (type == POA_RGB24)
-            free(buffer);
         return -1;
     }
 
@@ -1287,7 +1248,6 @@ int POABase::grabImage(float duration)
             *dstR++ = *src++;
         }
 
-        free(buffer);
     }
     guard.unlock();
 
@@ -1311,24 +1271,20 @@ bool POABase::isMonoBinActive()
     long monoBin = 0;
 
 #if 1   // MONO_BIN has supported since SDK v3.4.0
-    POABool isAuto = POA_FALSE;
-    POAConfigValue confVal;
-    POAErrors ret = POAGetConfig(mCameraInfo.cameraID, POA_MONO_BIN, &confVal, &isAuto);
+    POABool value;
+    POAErrors ret = Helpers::GetConfig(mCameraInfo.cameraID, POA_MONO_BIN, value);
     if (ret != POA_OK)
     {
         if (ret != POA_ERROR_INVALID_CONFIG)
-        {
             LOGF_ERROR("Failed to get mono bin information (%s).", Helpers::toString(ret));
-        }
+
         return false;
     }
-    monoBin = confVal.boolValue;
+    monoBin = (value == POA_TRUE);
 #endif
 
     if (monoBin == 0)
-    {
         return false;
-    }
 
     int width = 0, height = 0, bin = 1;
     POAImgFormat imgType = POA_RAW8;
@@ -1345,10 +1301,10 @@ bool POABase::isMonoBinActive()
 bool POABase::hasFlipControl()
 {
     if (find_if(begin(mControlCaps), end(mControlCaps), [](POAConfigAttributes cap)
-{
-    return cap.configID == POA_FLIP_BOTH;
-}) == end(mControlCaps))
-    return false;
+    {
+        return cap.configID == POA_FLIP_BOTH;
+    }) == end(mControlCaps))
+        return false;
     else
         return true;
 }
@@ -1357,15 +1313,11 @@ bool POABase::hasFlipControl()
 void POABase::temperatureTimerTimeout()
 {
     POAErrors ret;
-    POABool isAuto = POA_FALSE;
-    POAConfigValue confVal;
 
     double value = 0.0;
     IPState newState = TemperatureNP.getState();
 
-    ret = POAGetConfig(mCameraInfo.cameraID, POA_TEMPERATURE, &confVal, &isAuto);
-    value = confVal.floatValue;
-
+    ret = Helpers::GetConfig(mCameraInfo.cameraID, POA_TEMPERATURE, value);
     if (ret != POA_OK)
     {
         LOGF_ERROR("Failed to get temperature (%s).", Helpers::toString(ret));
@@ -1384,10 +1336,8 @@ void POABase::temperatureTimerTimeout()
     }
 
     // Update if there is a change
-    if (
-        std::abs(mCurrentTemperature - TemperatureNP[0].getValue()) > 0.05 ||
-        TemperatureNP.getState() != newState
-    )
+    if (std::abs(mCurrentTemperature - TemperatureNP[0].getValue()) > 0.05 ||
+        TemperatureNP.getState() != newState)
     {
         TemperatureNP.setState(newState);
         TemperatureNP[0].setValue(mCurrentTemperature);
@@ -1396,8 +1346,9 @@ void POABase::temperatureTimerTimeout()
 
     if (HasCooler())
     {
-        ret = POAGetConfig(mCameraInfo.cameraID, POA_COOLER_POWER, &confVal, &isAuto);
-        value = confVal.intValue;
+        long power;
+        ret = Helpers::GetConfig(mCameraInfo.cameraID, POA_COOLER_POWER, power);
+        value = static_cast<double>(power);
         if (ret != POA_OK)
         {
             LOGF_ERROR("Failed to get perc power information (%s).", Helpers::toString(ret));
@@ -1432,7 +1383,7 @@ IPState POABase::guidePulse(INDI::Timer &timer, float ms, POAConfig dir)
 
     if (ms < 1)
     {
-        usleep(ms * 1000);
+        std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(ms * 1000.0));
         timer.timeout();
         return IPS_OK;
     }
@@ -1512,7 +1463,6 @@ void POABase::createControls(int piNumberOfControls)
             continue;
 
         // Update Min/Max exposure as supported by the camera
-#ifdef USE_POA_EXP
         if (cap.configID == POA_EXPOSURE)
             continue;
 
@@ -1523,15 +1473,6 @@ void POABase::createControls(int piNumberOfControls)
             PrimaryCCD.setMinMaxStep("CCD_EXPOSURE", "CCD_EXPOSURE_VALUE", minExp, maxExp, 1);
             continue;
         }
-#else
-        if (cap.configID == POA_EXPOSURE)
-        {
-            double minExp = cap.minValue.intValue / 1000000.0;
-            double maxExp = cap.maxValue.intValue / 1000000.0;
-            PrimaryCCD.setMinMaxStep("CCD_EXPOSURE", "CCD_EXPOSURE_VALUE", minExp, maxExp, 1);
-            continue;
-        }
-#endif
 
         if (cap.configID == POA_USB_BANDWIDTH_LIMIT)
         {
@@ -1543,9 +1484,8 @@ void POABase::createControls(int piNumberOfControls)
 #endif
 
             LOGF_DEBUG("createControls->set USB %d", value);
-            POAConfigValue confVal;
-            confVal.intValue = value;
-            POASetConfig(mCameraInfo.cameraID, cap.configID, confVal, POA_FALSE);
+
+            Helpers::SetConfig(mCameraInfo.cameraID, cap.configID, value, POA_FALSE);
         }
 
         POABool isAuto = POA_FALSE;
@@ -1601,9 +1541,8 @@ void POABase::updateControls()
         auto numCtrlCap = static_cast<POAConfigAttributes *>(num.getAux());
         long value      = 0;
         POABool isAuto = POA_FALSE;
-        POAConfigValue confVal;
-        POAGetConfig(mCameraInfo.cameraID, numCtrlCap->configID, &confVal, &isAuto);
-        value = confVal.intValue;
+
+        Helpers::GetConfig(mCameraInfo.cameraID, numCtrlCap->configID, value, &isAuto);
 
         num.setValue(value);
 
@@ -1643,15 +1582,11 @@ void POABase::addFITSKeywords(INDI::CCDChip *targetChip, std::vector<INDI::FITSR
     // e-/ADU
     auto np = ControlNP.findWidgetByName("Gain");
     if (np)
-    {
         fitsKeywords.push_back({"GAIN", np->value, 3, "Gain"});
-    }
 
     np = ControlNP.findWidgetByName("Offset");
     if (np)
-    {
         fitsKeywords.push_back({"OFFSET", np->value, 3, "Offset"});
-    }
 }
 
 bool POABase::saveConfigItems(FILE *fp)
@@ -1718,36 +1653,35 @@ POAErrors POABase::POAGetROIFormat(int cameraID, int *width, int *height, int *b
 
 POAErrors POABase::POAPulseGuideOn(int cameraID, POAConfig dir)
 {
-    POAConfigValue confVal;
-    confVal.boolValue = POA_TRUE;
-    return POASetConfig(cameraID, dir, confVal, POA_FALSE); // start to guide
+    return Helpers::SetConfig(cameraID, dir, POA_TRUE, POA_FALSE); // start to guide
 }
 
 POAErrors POABase::POAPulseGuideOff(int cameraID, POAConfig dir)
 {
-    POAConfigValue confVal;
-    confVal.boolValue = POA_FALSE;
-    return POASetConfig(cameraID, dir, confVal, POA_FALSE); // stop to guide
+    return Helpers::SetConfig(cameraID, dir, POA_FALSE, POA_FALSE); // stop to guide
 }
 
 // Compensate bayer pttern by flip (effective for RAW data format)
-POAErrors POABase::POABayerCompensationByFlip(POAConfig flip, char *dest)
+POAErrors POABase::POABayerCompensationByFlip(POAConfig flip, char *dest, size_t destSize)
 {
     const char *src = getBayerString();
+
+    if (destSize < 5)
+        return POA_ERROR_OUT_OF_LIMIT;
 
     switch (flip)
     {
         case POA_FLIP_NONE:
-            sprintf(dest, "%c%c%c%c", src[0], src[1], src[2], src[3]);
+            snprintf(dest, destSize, "%c%c%c%c", src[0], src[1], src[2], src[3]);
             break;
         case POA_FLIP_HORI:
-            sprintf(dest, "%c%c%c%c", src[1], src[0], src[3], src[2]);
+            snprintf(dest, destSize, "%c%c%c%c", src[1], src[0], src[3], src[2]);
             break;
         case POA_FLIP_VERT:
-            sprintf(dest, "%c%c%c%c", src[2], src[3], src[0], src[1]);
+            snprintf(dest, destSize, "%c%c%c%c", src[2], src[3], src[0], src[1]);
             break;
         case POA_FLIP_BOTH:
-            sprintf(dest, "%c%c%c%c", src[3], src[2], src[1], src[0]);
+            snprintf(dest, destSize, "%c%c%c%c", src[3], src[2], src[1], src[0]);
             break;
         default:
             return POA_ERROR_INVALID_ARGU;

@@ -9,7 +9,7 @@ include(GNUInstallDirs)
 option(INDI_INSTALL_UDEV_RULES "Install UDEV rules" On)
 
 IF(NOT APPLE)
-set(UDEVRULES_INSTALL_DIR "/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
+set(UDEVRULES_INSTALL_DIR "/usr/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
 ENDIF(NOT APPLE)
 
 find_package(CFITSIO REQUIRED)
@@ -46,5 +46,5 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/indi_ffmv.xml DESTINATION ${INDI_DATA_
 
 IF(NOT APPLE AND INDI_INSTALL_UDEV_RULES)
 install(FILES 99-fireflymv.rules DESTINATION ${UDEVRULES_INSTALL_DIR})
-ENDIF(NOT APPLE)
+ENDIF(NOT APPLE AND INDI_INSTALL_UDEV_RULES)
 

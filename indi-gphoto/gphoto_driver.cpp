@@ -134,6 +134,8 @@ struct _gphoto_driver
     gphoto_widget *iso_widget;
     gphoto_widget *exposure_widget;
     gphoto_widget *bulb_widget;
+    int eos_press_full_index;
+    int eos_release_full_index;
     gphoto_widget *autoexposuremode_widget;
     gphoto_widget *capturetarget_widget;
     gphoto_widget *viewfinder_widget;
@@ -190,7 +192,7 @@ static int RTS_flag = TIOCM_RTS;
 
 void gphoto_set_debug(const char *name)
 {
-    strncpy(device, name, 64);
+    snprintf(device, sizeof(device), "%s", name);
 }
 
 static const char *widget_name(CameraWidget *widget)
@@ -620,8 +622,12 @@ static void *stop_bulb(void *arg)
             else
                 timeleft = 0;
 
+            if (gphoto->is_aborted)
+                timeleft = 0;
+
             if (timeleft <= 0)
             {
+                pthread_mutex_unlock(&gphoto->mutex);
                 if (gphoto->dsusb)
                 {
                     DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "Closing DSUSB shutter.");
@@ -649,14 +655,14 @@ static void *stop_bulb(void *arg)
                     DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Using widget:%s", gphoto->bulb_widget->name);
                     if (strcmp(gphoto->bulb_widget->name, "eosremoterelease") == 0)
                     {
-                        //600D eosremoterelease RELEASE FULL
-                        gphoto_set_widget_num(gphoto, gphoto->bulb_widget, EOS_RELEASE_FULL);
+                        gphoto_set_widget_num(gphoto, gphoto->bulb_widget, gphoto->eos_release_full_index);
                     }
                     else
                     {
                         gphoto_set_widget_num(gphoto, gphoto->bulb_widget, FALSE);
                     }
                 }
+                pthread_mutex_lock(&gphoto->mutex);
                 gphoto->command |= DSLR_CMD_DONE;
                 pthread_cond_signal(&gphoto->signal);
             }
@@ -669,8 +675,10 @@ static void *stop_bulb(void *arg)
         }
         if (!(gphoto->command & DSLR_CMD_DONE) && (gphoto->command & DSLR_CMD_CAPTURE))
         {
+            pthread_mutex_unlock(&gphoto->mutex);
             //gp_camera_capture(gphoto->camera, GP_CAPTURE_IMAGE, &gphoto->camerapath, gphoto->context);
             gp_camera_capture(gphoto->camera, GP_CAPTURE_IMAGE, &gphoto->camerapath, gphoto->context);
+            pthread_mutex_lock(&gphoto->mutex);
             gphoto->command |= DSLR_CMD_DONE;
             pthread_cond_signal(&gphoto->signal);
         }
@@ -817,7 +825,7 @@ static int download_image(gphoto_driver *gphoto, CameraFilePath *fn, int fd)
                      gphoto->handle_sdcard_image == DELETE_IMAGE ? "true" : "false");
     }
 
-    strncpy(gphoto->filename, fn->name, sizeof(gphoto->filename));
+    snprintf(gphoto->filename, sizeof(gphoto->filename), "%s", fn->name);
 
     if (fd < 0)
     {
@@ -1049,8 +1057,8 @@ int gphoto_mirrorlock(gphoto_driver *gphoto, int msec)
                                EOS_MIRROR_LOCKUP_ENABLE);
 #endif
 
-        gphoto_set_widget_num(gphoto, gphoto->bulb_widget, EOS_PRESS_FULL);
-        gphoto_set_widget_num(gphoto, gphoto->bulb_widget, EOS_RELEASE_FULL);
+        gphoto_set_widget_num(gphoto, gphoto->bulb_widget, gphoto->eos_press_full_index);
+        gphoto_set_widget_num(gphoto, gphoto->bulb_widget, gphoto->eos_release_full_index);
 
         usleep(msec * 1000);
 
@@ -1090,8 +1098,43 @@ int gphoto_mirrorlock(gphoto_driver *gphoto, int msec)
     return -1;
 }
 
+// Discard events left over from previous captures. A late GP_EVENT_CAPTURE_COMPLETE after a predefined exposure
+// would otherwise be taken by the next BULB exposure as its own, which then returns without an image and leaves
+// that image in the camera buffer, making the following captures fail as well.
+static void drain_pending_events(gphoto_driver *gphoto)
+{
+    for (int i = 0; i < 20; i++)
+    {
+        CameraEventType event = GP_EVENT_UNKNOWN;
+        void *data = nullptr;
+        if (gp_camera_wait_for_event(gphoto->camera, 10, &event, &data, gphoto->context) != GP_OK || event == GP_EVENT_TIMEOUT)
+        {
+            free(data);
+            return;
+        }
+
+        if (event == GP_EVENT_FILE_ADDED)
+        {
+            CameraFilePath *fn = static_cast<CameraFilePath *>(data);
+            int captureTarget = -1;
+            gphoto_get_capture_target(gphoto, &captureTarget);
+            // Only images in the camera RAM are removed; never touch the SD card.
+            if (captureTarget == 0)
+                gp_camera_file_delete(gphoto->camera, fn->folder, fn->name, gphoto->context);
+            DEBUGFDEVICE(device, INDI::Logger::DBG_WARNING, "Discarded stale image %s/%s from a previous capture.",
+                         fn->folder, fn->name);
+        }
+        else
+            DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Discarded stale camera event %d.", event);
+
+        free(data);
+    }
+}
+
 int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirror_lock)
 {
+    gphoto->is_aborted = false;
+    drain_pending_events(gphoto);
     if (gphoto->exposure_widget == nullptr)
     {
         DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "No exposure widget found. Can not expose!");
@@ -1102,8 +1145,6 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
                  "Starting exposure (exptime: %g secs, mirror lock: %d, force bulb: %s, exposure index: %d)",
                  exptime_usec / 1e6, mirror_lock, gphoto->force_bulb ? "true" : "false",
                  gphoto->exposure_widget ? gphoto->exposure_widget->value.num : -1);
-    pthread_mutex_lock(&gphoto->mutex);
-    DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "Mutex locked");
 
     // Set ISO Settings
     if (gphoto->iso >= 0)
@@ -1116,14 +1157,28 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
     // Find EXACT optimal exposure index in case we need to use it. If -1, we always use blob made if available
     int optimalExposureIndex = -1;
 
+    // Sub-second exposures cannot be timed in BULB (the release can arrive before the camera starts exposing),
+    // so they always use a predefined exposure, even when force bulb is on.
+    const bool subSecond = exptime_usec < 1000000;
+
     // JM 2018-09-23: In case force bulb is off, then we search for optimal exposure index
-    if (gphoto->force_bulb == false &&
+    if ((gphoto->force_bulb == false || subSecond) &&
             // No external shutter port is specified OR
             ((!gphoto->bulb_port[0] && !gphoto->dsusb) ||
              // External shutter port is specified but exposure time < 30 secs
              ((gphoto->bulb_port[0] || gphoto->dsusb) && exptime_usec <= RELEASE_SHUTTER_THRESHOLD)))
     {
         optimalExposureIndex = find_exposure_setting(gphoto, gphoto->exposure_widget, exptime_usec, true);
+
+        // No exact match for a sub-second exposure: use the nearest predefined exposure instead of BULB.
+        if (optimalExposureIndex == -1 && subSecond && gphoto->exposureList != nullptr)
+        {
+            optimalExposureIndex = find_exposure_setting(gphoto, gphoto->exposure_widget, exptime_usec, false);
+            if (optimalExposureIndex >= 0)
+                DEBUGFDEVICE(device, INDI::Logger::DBG_SESSION,
+                             "No predefined exposure of %g seconds, using the nearest one: %g seconds.",
+                             exptime_usec / 1e6, gphoto->exposureList[optimalExposureIndex]);
+        }
     }
 
     // Set Capture Target
@@ -1217,7 +1272,6 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
             if (gphoto->bulb_fd < 0)
             {
                 DEBUGFDEVICE(device, INDI::Logger::DBG_ERROR, "Failed to open serial port: %s", gphoto->bulb_port);
-                pthread_mutex_unlock(&gphoto->mutex);
                 return -1;
             }
 
@@ -1239,7 +1293,7 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
             // Check if the internal bulb widget is eosremoterelease, and if yes, set it accordingly
             if (strcmp(gphoto->bulb_widget->name, "eosremoterelease") == 0)
             {
-                gphoto_set_widget_num(gphoto, gphoto->bulb_widget, EOS_PRESS_FULL); //600D eosremoterelease PRESS FULL
+                gphoto_set_widget_num(gphoto, gphoto->bulb_widget, gphoto->eos_press_full_index);
             }
             // Otherwise use the regular bulb widget
             else
@@ -1251,7 +1305,6 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
         else
         {
             DEBUGDEVICE(device, INDI::Logger::DBG_ERROR, "No external or internal bulb widgets found. Cannot capture.");
-            pthread_mutex_unlock(&gphoto->mutex);
             return -1;
         }
 
@@ -1263,6 +1316,7 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
         timeradd(&current_time, &duration, &gphoto->bulb_end);
 
         // Start actual exposure
+        pthread_mutex_lock(&gphoto->mutex);
         gphoto->command = DSLR_CMD_BULB_CAPTURE;
         pthread_cond_signal(&gphoto->signal);
         pthread_mutex_unlock(&gphoto->mutex);
@@ -1283,7 +1337,6 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
     if (optimalExposureIndex == -1)
     {
         DEBUGDEVICE(device, INDI::Logger::DBG_ERROR, "Failed to set non-bulb exposure time.");
-        pthread_mutex_unlock(&gphoto->mutex);
         return -1;
     }
     else if (gphoto->exposure_widget && gphoto->exposure_widget->type == GP_WIDGET_TEXT)
@@ -1302,7 +1355,6 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
     // Lock the mirror if required.
     if (mirror_lock && gphoto_mirrorlock(gphoto, mirror_lock * 1000))
     {
-        pthread_mutex_unlock(&gphoto->mutex);
         return -1;
     }
 
@@ -1338,6 +1390,7 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
     //        DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "Exposure started");
     //        return 0;
     //    }
+    pthread_mutex_lock(&gphoto->mutex);
     gphoto->command = DSLR_CMD_CAPTURE;
     pthread_cond_signal(&gphoto->signal);
     pthread_mutex_unlock(&gphoto->mutex);
@@ -1361,16 +1414,20 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
         gphoto->camerafile = nullptr;
     }
     if (!(gphoto->command & DSLR_CMD_DONE))
+    {
         pthread_cond_wait(&gphoto->signal, &gphoto->mutex);
+    }
 
     DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "Exposure complete.");
 
     if (gphoto->command & DSLR_CMD_CAPTURE)
     {
+        gphoto->command = 0;
+        pthread_mutex_unlock(&gphoto->mutex);
+
         if (gphoto->handle_sdcard_image == IGNORE_IMAGE)
         {
             gphoto->command = 0;
-            pthread_mutex_unlock(&gphoto->mutex);
             DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "Image is ignored per settings.");
             return GP_OK;
         }
@@ -1380,12 +1437,19 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
         //Set exposure back to original value
         // JM 2018-08-06: Why do we really need to reset values here?
         //reset_settings(gphoto);
-        pthread_mutex_unlock(&gphoto->mutex);
+
+        // A ptp reset is needed by Sony A7II and A7III
+        // However, this session reset wrecks the A7RIV, preventing capture of successive frames
+        if (strstr(gphoto->manufacturer, "Sony") && strstr(gphoto->model, "ILCE")
+                && !strstr(gphoto->model, "7RM4"))
+            gp_camera_exit(gphoto->camera, gphoto->context);
+
         return result;
     }
 
     //Bulb mode
     gphoto->command = 0;
+    pthread_mutex_unlock(&gphoto->mutex);
     uint32_t waitMS = std::max(gphoto->download_timeout, 1) * 1000;
     bool downloadComplete = false;
     struct timeval start_time;
@@ -1408,7 +1472,6 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
                 usleep(250000);
                 continue;
             }
-            pthread_mutex_unlock(&gphoto->mutex);
             return -1;
         }
 
@@ -1416,7 +1479,6 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
         {
             case GP_EVENT_CAPTURE_COMPLETE:
                 DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "Capture event completed.");
-                pthread_mutex_unlock(&gphoto->mutex);
                 return GP_OK;
 
             case GP_EVENT_FILE_ADDED:
@@ -1439,7 +1501,6 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
                 // If already downloaded, then return immediately.
                 if (downloadComplete)
                 {
-                    pthread_mutex_unlock(&gphoto->mutex);
                     return GP_OK;
                 }
 
@@ -1459,7 +1520,6 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
 
                 // Give up as we timed out.
                 DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Event timed out after %d ms (elapsed: %d ms).", waitMS, elapsed);
-                pthread_mutex_unlock(&gphoto->mutex);
                 return -1;
             }
             break;
@@ -1474,20 +1534,18 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
 
 int gphoto_abort_exposure(gphoto_driver *gphoto)
 {
-    gphoto->command = DSLR_CMD_ABORT;
-    pthread_cond_signal(&gphoto->signal);
-    pthread_mutex_unlock(&gphoto->mutex);
-
     DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "Aborting exposure...");
 
-    // Wait until exposure is aborted
     pthread_mutex_lock(&gphoto->mutex);
-    if (!(gphoto->command & DSLR_CMD_DONE))
+    gphoto->command |= DSLR_CMD_ABORT;
+    pthread_cond_signal(&gphoto->signal);
+
+    // Wait until exposure is aborted
+    while (!(gphoto->command & DSLR_CMD_DONE))
+    {
         pthread_cond_wait(&gphoto->signal, &gphoto->mutex);
-
+    }
     pthread_mutex_unlock(&gphoto->mutex);
-
-    gphoto_read_exposure(gphoto);
 
     return GP_OK;
 }
@@ -1729,6 +1787,8 @@ gphoto_driver *gphoto_open(Camera *camera, GPContext *context, const char *model
     gphoto->dsusb                  = nullptr;
     gphoto->force_bulb             = true;
     gphoto->last_sensor_temp       = -273.0; // 0 degrees Kelvin
+    gphoto->eos_press_full_index   = -1;
+    gphoto->eos_release_full_index = -1;
 
     result = gp_camera_get_config(gphoto->camera, &gphoto->config, gphoto->context);
     if (result < GP_OK)
@@ -1739,8 +1799,33 @@ gphoto_driver *gphoto_open(Camera *camera, GPContext *context, const char *model
         return nullptr;
     }
 
+    gphoto->manufacturer    = nullptr;
+    gphoto->model           = nullptr;
+
+    // Find Manufacturer
+    if ((widget = find_widget(gphoto, "manufacturer")) != nullptr)
+    {
+        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Manufacturer: %s", widget->value.text);
+        gphoto->manufacturer = widget->value.text;
+    }
+
+    // Find Model
+    if ((widget = find_widget(gphoto, "cameramodel")) != nullptr || (widget = find_widget(gphoto, "model")) != nullptr)
+    {
+        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Model: %s", widget->value.text);
+        gphoto->model = widget->value.text;
+    }
+    // Make sure manufacturer is set to something useful
+    if (gphoto->manufacturer == nullptr)
+        gphoto->manufacturer = gphoto->model;
+
+    if (strstr(gphoto->manufacturer, "Canon"))
+        gphoto->supports_temperature = true;
+
     // Set 'capture=1' for Canon DSLRs.  Won't harm other cameras
-    if ((widget = find_widget(gphoto, "capture")))
+    // ...avoid this for Sony camera (on A7II and A7III it triggers exposure on init)
+    if ( !(strstr(gphoto->manufacturer, "Sony") && strstr(gphoto->model, "ILCE")) &&
+            (widget = find_widget(gphoto, "capture")) )
     {
         gphoto_set_widget_num(gphoto, widget, TRUE);
         widget_free(widget);
@@ -1782,8 +1867,6 @@ gphoto_driver *gphoto_open(Camera *camera, GPContext *context, const char *model
     if (gphoto->format_widget == nullptr)
         gphoto->format_widget = find_widget(gphoto, "imagequality");
     gphoto->format          = -1;
-    gphoto->manufacturer    = nullptr;
-    gphoto->model           = nullptr;
     gphoto->upload_settings = GP_UPLOAD_CLIENT;
     gphoto->handle_sdcard_image = SAVE_IMAGE;
     gphoto->is_aborted = false;
@@ -1816,6 +1899,38 @@ gphoto_driver *gphoto_open(Camera *camera, GPContext *context, const char *model
         int ret = gphoto_read_widget(gphoto->bulb_widget);
         if (ret == GP_OK)
             show_widget(gphoto->bulb_widget, "\t\t");
+
+        // Dynamically discover eosremoterelease Press / Release indices
+        // from the widget choices, since the ordering varies between libgphoto2 versions.
+        // The Canon 600D (and similar) require "Press Full MF" (or "Press Full")
+        // to start BULB and "Release" (the last choice) to end it.
+        if (strcmp(gphoto->bulb_widget->name, "eosremoterelease") == 0)
+        {
+            gphoto->eos_press_full_index = -1;
+            gphoto->eos_release_full_index = -1;
+            for (int i = 0; i < gphoto->bulb_widget->choice_cnt; i++)
+            {
+                // Look for "Press Full MF" first, then any "Press Full" variant
+                if (strcmp(gphoto->bulb_widget->choices[i], "Press Full MF") == 0)
+                    gphoto->eos_press_full_index = i;
+                else if (gphoto->eos_press_full_index < 0 && strstr(gphoto->bulb_widget->choices[i], "Press Full"))
+                    gphoto->eos_press_full_index = i;
+
+                // Look for plain "Release" (higher priority) then "Release Full"
+                if (strcmp(gphoto->bulb_widget->choices[i], "Release") == 0)
+                    gphoto->eos_release_full_index = i;
+                else if (gphoto->eos_release_full_index < 0 && strcmp(gphoto->bulb_widget->choices[i], "Release Full") == 0)
+                    gphoto->eos_release_full_index = i;
+            }
+            // Fallback to known working values from the working test script
+            if (gphoto->eos_press_full_index < 0)
+                gphoto->eos_press_full_index = 4;
+            if (gphoto->eos_release_full_index < 0)
+                gphoto->eos_release_full_index = 7;
+            DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG,
+                         "eosremoterelease: Press Full index=%d, Release Full index=%d",
+                         gphoto->eos_press_full_index, gphoto->eos_release_full_index);
+        }
     }
     else
         DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "No bulb widget found.");
@@ -1859,30 +1974,10 @@ gphoto_driver *gphoto_open(Camera *camera, GPContext *context, const char *model
                      gphoto->customfuncex_widget->name);
     }
 
-    // Find Manufacturer
-    if ((widget = find_widget(gphoto, "manufacturer")) != nullptr)
-    {
-        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Manufacturer: %s", widget->value.text);
-        gphoto->manufacturer = widget->value.text;
-    }
-
-    // Find Model
-    if ((widget = find_widget(gphoto, "cameramodel")) != nullptr || (widget = find_widget(gphoto, "model")) != nullptr)
-    {
-        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Model: %s", widget->value.text);
-        gphoto->model = widget->value.text;
-    }
-    // Make sure manufacturer is set to something useful
-    if (gphoto->manufacturer == nullptr)
-        gphoto->manufacturer = gphoto->model;
-
-    if (strstr(gphoto->manufacturer, "Canon"))
-        gphoto->supports_temperature = true;
-
     // Check for user
     if (shutter_release_port)
     {
-        strncpy(gphoto->bulb_port, shutter_release_port, sizeof(gphoto->bulb_port));
+        snprintf(gphoto->bulb_port, sizeof(gphoto->bulb_port), "%s", shutter_release_port);
         /*if (strcmp(gphoto->bulb_port,"/dev/nullptr") != 0 )
         {
             DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG,"Using external shutter-release cable");
@@ -2318,7 +2413,7 @@ int gphoto_manual_focus(gphoto_driver *gphoto, int speed, char *errMsg)
         }
         case GP_WIDGET_RANGE:
         {
-            int rval = speed;
+            float rval = speed;
 
             /* Range is on Nikon from -32768 <-> 32768 */
             if (strstr(device, "Nikon"))
@@ -2348,6 +2443,11 @@ int gphoto_manual_focus(gphoto_driver *gphoto, int speed, char *errMsg)
                         break;
                 }
             }
+
+            /* Reset to 0 first so the camera registers a change on repeated calls */
+            const float zero = 0;
+            gp_widget_set_value(gphoto->focus_widget->widget, &zero);
+            gphoto_set_config(gphoto->camera, gphoto->config, gphoto->context);
 
             rc = gp_widget_set_value(gphoto->focus_widget->widget, &rval);
             if (rc < GP_OK)

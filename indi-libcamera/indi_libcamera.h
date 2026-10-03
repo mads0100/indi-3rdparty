@@ -22,6 +22,9 @@
 
 #include <indisinglethreadpool.h>
 #include <stdint.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 #include "core/rpicam_app.hpp"
 #include "core/rpicam_encoder.hpp"
@@ -29,113 +32,167 @@
 
 #include <vector>
 
+// rpicam-apps defines LOG_ERROR, which conflicts with libindi.
+// Undefine it before including libindi headers.
+#undef LOG_ERROR
+
 #include <indiccd.h>
 #include <inditimer.h>
 
+struct RpiCamProperties
+{
+    template<typename T>
+    struct ControlRange
+    {
+        T min;
+        T max;
+        T def;
+    };
+
+    ControlRange<float> brightness    = {-1.0f, 1.0f, 0.0f};
+    ControlRange<float> contrast      = {0.0f, 15.99f, 1.0f};
+    ControlRange<float> saturation    = {0.0f, 15.99f, 1.0f};
+    ControlRange<float> sharpness     = {0.0f, 16.0f, 1.0f};
+    ControlRange<float> gain          = {0.0f, 100.0f, 0.0f};
+    ControlRange<float> colourGains   = {0.0f, 32.0f, 1.0f};
+    ControlRange<float> exposureTime  = {0.000014, 3600.0, 0.02}; // in seconds
+    ControlRange<float> exposureValue = {-8.0f, 8.0f, 0.0f};
+};
+
 class RPiCamINDIApp : public RPiCamApp
 {
-public:
-    RPiCamINDIApp() : RPiCamApp(std::make_unique<StillOptions>()) {}
+    public:
+        RPiCamINDIApp() : RPiCamApp(std::make_unique<StillOptions>()) {}
 
-    StillOptions *GetOptions() const
-    {
-        return static_cast<StillOptions *>(options_.get());
-    }
+        StillOptions *GetOptions() const
+        {
+            return static_cast<StillOptions *>(options_.get());
+        }
 };
 
 class SingleWorker;
 class INDILibCamera : public INDI::CCD
 {
-public:
-    INDILibCamera(uint8_t index, const libcamera::ControlList &list);
+    public:
+        INDILibCamera(uint8_t index, std::shared_ptr<libcamera::Camera> cam);
 
-    virtual const char *getDefaultName() override;
+        virtual const char *getDefaultName() override;
 
-    virtual bool initProperties() override;
-    virtual bool updateProperties() override;
+        virtual bool initProperties() override;
+        virtual bool updateProperties() override;
 
-    virtual bool Connect() override;
-    virtual bool Disconnect() override;
+        virtual bool Connect() override;
+        virtual bool Disconnect() override;
 
-    virtual bool StartExposure(float duration) override;
-    virtual bool AbortExposure() override;
+        virtual bool StartExposure(float duration) override;
+        virtual bool AbortExposure() override;
 
-    static void default_signal_handler(int signal_number);
+        static void default_signal_handler(int signal_number);
 
-protected:
+    protected:
 
-    virtual bool ISNewNumber(const char *dev, const char *name, double values[], char *names[], int n) override;
-    virtual bool ISNewSwitch(const char *dev, const char *name, ISState *states, char *names[], int n) override;
+        virtual bool ISNewNumber(const char *dev, const char *name, double values[], char *names[], int n) override;
+        virtual bool ISNewSwitch(const char *dev, const char *name, ISState *states, char *names[], int n) override;
 
-    // Streaming
-    virtual bool StartStreaming() override;
-    virtual bool StopStreaming() override;
+        // Streaming
+        virtual bool StartStreaming() override;
+        virtual bool StopStreaming() override;
 
-    virtual bool UpdateCCDFrame(int x, int y, int w, int h) override;
-    virtual bool UpdateCCDBin(int binx, int biny) override;
+        virtual bool UpdateCCDFrame(int x, int y, int w, int h) override;
+        virtual bool UpdateCCDBin(int binx, int biny) override;
 
-    // specific keywords
-    virtual void addFITSKeywords(INDI::CCDChip *targetChip, std::vector<INDI::FITSRecord> &fitsKeywords) override;
+        // specific keywords
+        virtual void addFITSKeywords(INDI::CCDChip *targetChip, std::vector<INDI::FITSRecord> &fitsKeywords) override;
 
-    // Save config
-    virtual bool saveConfigItems(FILE *fp) override;
+        // Save config
+        virtual bool saveConfigItems(FILE *fp) override;
 
-    /** Get the current Bayer string used */
-    const char *getBayerString() const;
-    INDI_PIXEL_FORMAT bayerToPixelFormat(const char *bayer);
-    int getColorspaceFlags(std::string const &codec);
+        /** Get the current Bayer string used */
+        const char *getBayerString() const;
+        INDI_PIXEL_FORMAT bayerToPixelFormat(const char *bayer);
+        int getColorspaceFlags(std::string const &codec);
 
-protected:
-    INDI::SingleThreadPool m_Worker;
-    void workerStreamVideo(const std::atomic_bool &isAboutToQuit, double framerate);
-    void workerExposure(const std::atomic_bool &isAboutToQuit, float duration);
-    void outputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe);
-    void metadataReady(libcamera::ControlList &metadata);
-    bool SetCaptureFormat(uint8_t index) override;
-    void initSwitch(INDI::PropertySwitch &switchSP, int n, const char **names);
+    protected:
+        INDI::SingleThreadPool m_Worker;
+        void workerStreamVideo(const std::atomic_bool &isAboutToQuit, double framerate);
+        void workerExposure(const std::atomic_bool &isAboutToQuit, float duration);
+        void outputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe);
+        void metadataReady(libcamera::ControlList &metadata);
+        bool SetCaptureFormat(uint8_t index) override;
+        void initSwitch(INDI::PropertySwitch &switchSP, int n, const char **names);
 
-    void configureStillOptions(StillOptions *options, double duration);
-    void configureVideoOptions(VideoOptions *options, double framerate);
+        void configureStillOptions(StillOptions *options, double duration);
+        void configureVideoOptions(VideoOptions *options, double framerate);
 
 
-protected:
-    /** Get initial parameters from camera */
-    void setup();
+    protected:
+        /** Get initial parameters from camera */
+        void setup();
 
-    enum
-    {
-        CAPTURE_DNG,
-        CAPTURE_JPG
-    };
+        enum
+        {
+            CAPTURE_DNG,
+            CAPTURE_JPG
+        };
 
-    bool processRAW(const char *filename, uint8_t **memptr, size_t *memsize, int *n_axis, int *w, int *h, int *bitsperpixel, char *bayer_pattern);
+        bool processRAW(const char *filename, uint8_t **memptr, size_t *memsize, int *n_axis, int *w, int *h, int *bitsperpixel,
+                        char *bayer_pattern);
 
-    bool processRAWMemory(unsigned char *inBuffer, unsigned long inSize, uint8_t **memptr, size_t *memsize, int *n_axis, int *w, int *h, int *bitsperpixel, char *bayer_pattern);
+        bool processRAWMemory(unsigned char *inBuffer, unsigned long inSize, uint8_t **memptr, size_t *memsize, int *n_axis, int *w,
+                              int *h, int *bitsperpixel, char *bayer_pattern);
 
-    bool processJPEG(const char *filename, uint8_t **memptr, size_t *memsize, int *naxis, int *w, int *h);
+        bool processJPEG(const char *filename, uint8_t **memptr, size_t *memsize, int *naxis, int *w, int *h);
 
-    int processJPEGMemory(unsigned char *inBuffer, unsigned long inSize, uint8_t **memptr, size_t *memsize, int *naxis, int *w, int *h);
+        int processJPEGMemory(unsigned char *inBuffer, unsigned long inSize, uint8_t **memptr, size_t *memsize, int *naxis, int *w,
+                              int *h);
 
-    void shutdownVideo();
+        void shutdownVideo();
 
-private:
+    private:
 
-    enum
-    {
-        AdjustBrightness = 0, AdjustContrast, AdjustSaturation, AdjustSharpness, AdjustQuality, AdjustExposureValue,
-        //AdjustMeteringMode, AdjustExposureMode, AdjustAwbMode,
-        AdjustAwbRed, AdjustAwbBlue
-    };
+        enum
+        {
+            AdjustBrightness = 0, AdjustContrast, AdjustSaturation, AdjustSharpness, AdjustQuality, AdjustExposureValue,
+            //AdjustMeteringMode, AdjustExposureMode, AdjustAwbMode,
+            AdjustAwbRed, AdjustAwbBlue
+        };
 
-    INDI::PropertySwitch AdjustExposureModeSP {0}, AdjustAwbModeSP {0}, AdjustMeteringModeSP {0}, AdjustDenoiseModeSP {0} ;
-    INDI::PropertyNumber AdjustmentNP {AdjustAwbBlue+1};
-    INDI::PropertyNumber GainNP {1};
+        INDI::PropertyText  LibCameraVersionTP {1};
+        INDI::PropertySwitch AdjustExposureModeSP {0}, AdjustAwbModeSP {0}, AdjustMeteringModeSP {0}, AdjustDenoiseModeSP {0} ;
+        INDI::PropertyNumber AdjustmentNP {AdjustAwbBlue + 1};
+        INDI::PropertyNumber GainNP {1};
+        INDI::PropertySwitch GainConversionSP {2};
 
-    // std::unique_ptr<RPiCamApp> m_CameraApp;
-    // std::unique_ptr<RPiCamEncoder> m_CameraEncoder;
+        // std::unique_ptr<RPiCamApp> m_CameraApp;
+        // std::unique_ptr<RPiCamEncoder> m_CameraEncoder;
 
-    int m_LiveVideoWidth {-1}, m_LiveVideoHeight {-1};
-    uint8_t m_CameraIndex;
-    libcamera::ControlList m_ControlList;
+        INDI_PIXEL_FORMAT m_pixel_format {INDI_BAYER_RGGB};
+        bool m_csi_format_packed {false};
+        unsigned int m_bit_depth {8};
+        int m_black_levels[4] {0, 0, 0, 0};
+        int m_LiveVideoWidth {-1}, m_LiveVideoHeight {-1};
+        uint8_t m_CameraIndex;
 
+        uint32_t m_CaptureWidth = 0;
+        uint32_t m_CaptureHeight = 0;
+
+        libcamera::ControlList m_ControlList;
+
+        enum class GainConversionMode
+        {
+            DynamicRange,
+            LowNoise
+        };
+
+        bool readGainConversionMode(GainConversionMode &mode) const;
+        bool writeGainConversionMode(GainConversionMode mode);
+        void updateGainConversionUI();
+
+        // Fast exposure loop state
+        std::atomic<bool> m_fastExposureActive { false };
+        std::atomic<int> m_fastExposureSignals { 0 };
+        std::mutex m_fastExposureMutex;
+        std::condition_variable m_fastExposureCV;
+
+        RpiCamProperties getAvailableCamProperties();
 };

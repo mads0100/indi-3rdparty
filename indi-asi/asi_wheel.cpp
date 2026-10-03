@@ -39,70 +39,38 @@
 #include <deque>
 #include <memory>
 
+#include <hotplugmanager.h>
+#include "asi_wheel_hotplug_handler.h"
+
 //#define SIMULATION
 
 static class Loader
 {
-        std::deque<std::unique_ptr<ASIWHEEL>> wheels;
+        std::shared_ptr<INDI::ASIWHEELHotPlugHandler> hotPlugHandler;
     public:
         Loader()
         {
-#ifdef SIMULATION
-            EFW_INFO info;
-            info.ID = 1;
-            strncpy(info.Name, "Simulated EFW8", 64);
-            info.slotNum = 0;
-            wheels.push_back(std::unique_ptr<ASIWHEEL>(new ASIWHEEL(info, info.Name)));
-#else
-            int num_wheels = EFWGetNum();
-
-            if (num_wheels <= 0)
-            {
-                IDLog("No ASI EFW detected.");
-                return;
-            }
-            int num_wheels_ok = 0;
-            char *envDev = getenv("INDIDEV");
-            for (int i = 0; i < num_wheels; i++)
-            {
-                int id;
-                EFW_ERROR_CODE result = EFWGetID(i, &id);
-                if (result != EFW_SUCCESS)
-                {
-                    IDLog("ERROR: ASI EFW %d EFWGetID error %d.", i + 1, result);
-                    continue;
-                }
-                EFW_INFO info;
-                result = EFWGetProperty(id, &info);
-                if (result != EFW_SUCCESS && result != EFW_ERROR_CLOSED)   // TODO: remove the ERROR_CLOSED hack
-                {
-                    IDLog("ERROR: ASI EFW %d EFWGetProperty error %d.", i + 1, result);
-                    continue;
-                }
-                std::string name = "ZWO " + std::string(info.Name);
-                if (envDev && envDev[0])
-                    name = envDev;
-
-                // If we only have a single device connected
-                // then favor the INDIDEV driver label over the auto-generated name above
-                if (num_wheels > 1)
-                    name += " " + std::to_string(i + 1);
-
-                wheels.push_back(std::unique_ptr<ASIWHEEL>(new ASIWHEEL(info, name.c_str())));
-                num_wheels_ok++;
-            }
-            IDLog("%d ZWO EFW attached out of %d detected.", num_wheels_ok, num_wheels);
-#endif
+            hotPlugHandler = std::make_shared<INDI::ASIWHEELHotPlugHandler>();
+            INDI::HotPlugManager::getInstance().registerHandler(hotPlugHandler);
+            INDI::HotPlugManager::getInstance().start(1000); // Start hot-plug checks every 1 second
         }
 } loader;
 
-ASIWHEEL::ASIWHEEL(const EFW_INFO &info, const char *name)
+ASIWHEEL::ASIWHEEL(const EFW_INFO &info, const char *name, const std::string &serialNumber)
+    : mEFWInfo(info)
+    , mSerialNumber(serialNumber)
 {
     fw_id              = info.ID;
     CurrentFilter      = 0;
     FilterSlotNP[0].setMin(0);
     FilterSlotNP[0].setMax(0);
-    setDeviceName(name);
+
+    // Apply saved nickname from serial number. Returns true if a nickname was found.
+    // If no nickname exists, fall back to the unique name supplied by the hotplug handler
+    // (which may include a counter suffix, e.g. "ZWO EFW 1", for multiple wheels).
+    if (mSerialNumber.empty() || !setDeviceNicknameFromId(mSerialNumber.c_str()))
+        setDeviceName(name);
+
     setVersion(ASI_VERSION_MAJOR, ASI_VERSION_MINOR);
 }
 
@@ -204,7 +172,11 @@ bool ASIWHEEL::initProperties()
     IUFillSwitchVector(&CalibrateSP, CalibrateS, 1, getDeviceName(), "FILTER_CALIBRATION", "Calibrate",
                        MAIN_CONTROL_TAB, IP_RW, ISR_ATMOST1, 0, IPS_IDLE);
 
+    SerialNumberTP[0].fill("SN", "SN", mSerialNumber);
+    SerialNumberTP.fill(getDeviceName(), "Serial Number", "Serial Number", INFO_TAB, IP_RO, 60, IPS_IDLE);
+
     addAuxControls();
+    addNicknameControl();
     setDefaultPollingPeriod(250);
     return true;
 }
@@ -223,11 +195,15 @@ bool ASIWHEEL::updateProperties()
         }
         defineProperty(&UniDirectionalSP);
         defineProperty(&CalibrateSP);
+        if (!mSerialNumber.empty())
+            defineProperty(SerialNumberTP);
     }
     else
     {
         deleteProperty(UniDirectionalSP.name);
         deleteProperty(CalibrateSP.name);
+        if (!mSerialNumber.empty())
+            deleteProperty(SerialNumberTP);
     }
 
     return true;
@@ -382,6 +358,14 @@ bool ASIWHEEL::saveConfigItems(FILE *fp)
     INDI::FilterWheel::saveConfigItems(fp);
     IUSaveConfigSwitch(fp, &UniDirectionalSP);
     return true;
+}
+
+void ASIWHEEL::nicknameSet(const char *nickname)
+{
+    if (!mSerialNumber.empty())
+    {
+        saveNicknameId(nickname, mSerialNumber.c_str());
+    }
 }
 
 void ASIWHEEL::TimerHelperCalibrate(void *context)

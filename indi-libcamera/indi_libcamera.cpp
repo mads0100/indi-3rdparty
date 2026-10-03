@@ -31,7 +31,10 @@
 #include "core/rpicam_encoder.hpp"
 #include "output/output.hpp"
 
+#include <libcamera/camera_manager.h>
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <vector>
 #include <map>
@@ -43,12 +46,23 @@
 #include <libraw.h>
 #include <jpeglib.h>
 
+#include <fstream>
+#include <cerrno>
+#include <cstring>
 
 #define CONTROL_TAB "Controls"
 
+static constexpr const char *DRIVER_NAME = "LibCamera";
+
+namespace
+{
+constexpr const char *HCG_SYSFS =
+    "/sys/module/imx290/parameters/hcg_mode";
+}
+
 static class Loader
 {
-        std::map<int, std::shared_ptr<INDILibCamera>> cameras;
+        std::map<int, std::shared_ptr<INDILibCamera >> cameras;
     public:
         Loader()
         {
@@ -60,23 +74,22 @@ static class Loader
         void load()
         {
             RPiCamINDIApp app;
-            int argc = 0;
-            char *argv[] = {};
+            int argc = 1;
+            char *argv[] = { (char*)"indi_libcamera_ccd" };
             auto options = app.GetOptions();
             if (options->Parse(argc, argv))
             {
-                auto new_cameras = app.GetCameras();
+                auto rpi_cameras = app.GetCameras();
 
-                if (new_cameras.size() == 0)
+                if (rpi_cameras.size() == 0)
                 {
                     IDLog("No cameras detected.");
                     return;
                 }
 
-                for (size_t i = 0; i < new_cameras.size(); i++)
+                for (size_t i = 0; i < rpi_cameras.size(); i++)
                 {
-                    auto newCamera = new INDILibCamera(i, new_cameras[i]->properties());
-                    cameras[i] = std::shared_ptr<INDILibCamera>(newCamera);
+                    cameras[i] = std::make_shared<INDILibCamera>(i, rpi_cameras[i]);
                 }
             }
         }
@@ -86,11 +99,16 @@ static class Loader
 ///////////////////////////////////////////////////////////////////////
 /// Generic constructor
 ///////////////////////////////////////////////////////////////////////
-INDILibCamera::INDILibCamera(uint8_t index, const libcamera::ControlList &list) : m_CameraIndex(index), m_ControlList(list)
+INDILibCamera::INDILibCamera(uint8_t index, std::shared_ptr<libcamera::Camera> cam) : m_CameraIndex(index), m_ControlList(cam->properties())
 {
     setVersion(LIBCAMERA_VERSION_MAJOR, LIBCAMERA_VERSION_MINOR);
     signal(SIGBUS, default_signal_handler);
-    auto fullName = std::string("LibCamera ") + list.get(properties::Model).value() + "-" + std::to_string(index);
+    auto model = m_ControlList.get(properties::Model).value();
+    auto fullName = std::string(DRIVER_NAME)
+              + " "
+              + std::string(model)
+              + "-"
+              + std::to_string(index);
     setDeviceName(fullName.c_str());
 }
 
@@ -99,7 +117,7 @@ INDILibCamera::INDILibCamera(uint8_t index, const libcamera::ControlList &list) 
 /////////////////////////////////////////////////////////////////////////////
 const char *INDILibCamera::getDefaultName()
 {
-    return "LibCamera";
+    return DRIVER_NAME;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -126,6 +144,7 @@ int INDILibCamera::getColorspaceFlags(std::string const &codec)
 /////////////////////////////////////////////////////////////////////////////
 void INDILibCamera::workerStreamVideo(const std::atomic_bool &isAboutToQuit, double framerate)
 {
+    LOGF_INFO("Starting video stream at %.2f fps", framerate);
     RPiCamEncoder app;
     auto options = app.GetOptions();
     configureVideoOptions(options, framerate);
@@ -137,7 +156,7 @@ void INDILibCamera::workerStreamVideo(const std::atomic_bool &isAboutToQuit, dou
     try
     {
         app.OpenCamera();
-        app.ConfigureVideo(getColorspaceFlags(options->codec));
+        app.ConfigureVideo(getColorspaceFlags(options->Get().codec));
         app.StartEncoder();
         app.StartCamera();
     }
@@ -223,6 +242,7 @@ void INDILibCamera::metadataReady(libcamera::ControlList &metadata)
 /////////////////////////////////////////////////////////////////////////////
 void INDILibCamera::workerExposure(const std::atomic_bool &isAboutToQuit, float duration)
 {
+    LOGF_INFO("Starting exposure for %.3f seconds", duration);
     RPiCamINDIApp app;
     auto options = app.GetOptions();
     configureStillOptions(options, duration);
@@ -241,203 +261,245 @@ void INDILibCamera::workerExposure(const std::atomic_bool &isAboutToQuit, float 
         app.StopCamera();
         app.Teardown();
         app.CloseCamera();
-    }
-
-    RPiCamApp::Msg msg = app.Wait();
-    if (msg.type != RPiCamApp::MsgType::RequestComplete)
-    {
-        PrimaryCCD.setExposureFailed();
-        app.StopCamera();
-        app.Teardown();
-        app.CloseCamera();
-        LOGF_ERROR("Exposure failed: %d", msg.type);
-        return;
-    }
-    else if (isAboutToQuit)
-    {
-        app.StopCamera();
-        app.Teardown();
-        app.CloseCamera();
         return;
     }
 
-    bool raw = CaptureFormatSP.findOnSwitchIndex() == CAPTURE_DNG;
-    auto stream = raw ? app.RawStream() : app.StillStream();
-    auto payload = std::get<CompletedRequestPtr>(msg.payload);
-    StreamInfo info = app.GetStreamInfo(stream);
-    BufferReadSync r(&app, payload->buffers[stream]);
-    const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
-
-    try
+    bool keepCapturing = true;
+    while (keepCapturing && !isAboutToQuit)
     {
+        RPiCamApp::Msg msg = app.Wait();
+        if (msg.type != RPiCamApp::MsgType::RequestComplete)
+        {
+            PrimaryCCD.setExposureFailed();
+            LOGF_ERROR("Exposure failed: %d", msg.type);
+            m_fastExposureActive = false;
+            app.StopCamera();
+            app.Teardown();
+            app.CloseCamera();
+            return;
+        }
+        else if (isAboutToQuit)
+        {
+            m_fastExposureActive = false;
+            app.StopCamera();
+            app.Teardown();
+            app.CloseCamera();
+            return;
+        }
+
+        bool raw = CaptureFormatSP.findOnSwitchIndex() == CAPTURE_DNG;
+        auto stream = raw ? app.RawStream() : app.StillStream();
+        libcamera::ControlList frameMetadata;
         char filename[MAXINDIFORMAT] {0};
 
-        if (raw)
+        // --- Early-release scope ---
+        // payload and r are destroyed at scope exit, triggering queueRequest so the
+        // camera immediately starts the next frame while we process the saved file.
+        try
         {
-            strncpy(filename, "/tmp/output.dng", MAXINDIFORMAT);
-            dng_save(mem, info, payload->metadata, filename, app.CameraId(), options);
-        }
-        else
-        {
-            strncpy(filename, "/tmp/output.jpg", MAXINDIFORMAT);
-            jpeg_save(mem, info, payload->metadata, filename, app.CameraId(), options);
-        }
+            auto payload = std::move(std::get<CompletedRequestPtr>(msg.payload));
+            StreamInfo info = app.GetStreamInfo(stream);
+            BufferReadSync r(&app, payload->buffers[stream]);
+            const std::vector<libcamera::Span<uint8_t>> mem = r.Get();
 
-        char bayer_pattern[8] = {};
-        uint8_t * memptr = PrimaryCCD.getFrameBuffer();
-        size_t memsize = 0;
-        int naxis = 2, w = 0, h = 0, bpp = 8;
-
-        if (EncodeFormatSP[FORMAT_FITS].getState() == ISS_ON)
-        {
-            if (CaptureFormatSP.findOnSwitchIndex() == CAPTURE_DNG)
+            if (raw)
             {
-                if (!processRAW(filename, &memptr, &memsize, &naxis, &w, &h, &bpp, bayer_pattern))
-                {
-                    LOG_ERROR("Exposure failed to parse raw image.");
-                    PrimaryCCD.setExposureFailed();
-                    app.StopCamera();
-                    app.Teardown();
-                    app.CloseCamera();
-                    unlink(filename);
-                    return;
-                }
-
-                SetCCDCapability(GetCCDCapability() | CCD_HAS_BAYER);
-                BayerTP[2].setText(bayer_pattern);
-                BayerTP.apply();
+                strncpy(filename, "/tmp/output.dng", MAXINDIFORMAT);
+                dng_save(mem, info, payload->metadata, filename, app.CameraId(), options);
             }
             else
             {
-                if (!processJPEG(filename, &memptr, &memsize, &naxis, &w, &h))
-                {
-                    LOG_ERROR("Exposure failed to parse jpeg.");
-                    PrimaryCCD.setExposureFailed();
-                    app.StopCamera();
-                    app.Teardown();
-                    app.CloseCamera();
-                    unlink(filename);
-                    return;
-                }
-
-                LOGF_DEBUG("read_jpeg: memsize (%d) naxis (%d) w (%d) h (%d) bpp (%d)", memsize, naxis, w, h, bpp);
-
-                SetCCDCapability(GetCCDCapability() & ~CCD_HAS_BAYER);
+                strncpy(filename, "/tmp/output.jpg", MAXINDIFORMAT);
+                jpeg_save(mem, info, payload->metadata, filename, app.CameraId(), options);
             }
 
-            PrimaryCCD.setImageExtension("fits");
+            // Copy metadata before releasing payload
+            frameMetadata = payload->metadata;
+        }
+        catch (std::exception &e)
+        {
+            LOGF_ERROR("Error saving image: %s", e.what());
+            PrimaryCCD.setExposureFailed();
+            m_fastExposureActive = false;
+            app.StopCamera();
+            app.Teardown();
+            app.CloseCamera();
+            return;
+        }
+        // payload and r destroyed here → queueRequest → camera starts capturing next frame
 
-            uint16_t subW = PrimaryCCD.getSubW();
-            uint16_t subH = PrimaryCCD.getSubH();
+        // --- Post-capture processing (runs in parallel with the next frame exposure) ---
+        try
+        {
+            char bayer_pattern[8] = {};
+            uint8_t * memptr = PrimaryCCD.getFrameBuffer();
+            size_t memsize = 0;
+            int naxis = 2, w = 0, h = 0, bpp = 8;
 
-            // If subframing is requested
-            // If either axis is less than the image resolution
-            // then we subframe, given the OTHER axis is within range as well.
-            if ( (subW > 0 && subH > 0) && ((subW < w && subH <= h) || (subH < h && subW <= w)))
+            if (EncodeFormatSP[FORMAT_FITS].getState() == ISS_ON)
             {
-
-                uint16_t subX = PrimaryCCD.getSubX();
-                uint16_t subY = PrimaryCCD.getSubY();
-
-                int subFrameSize     = subW * subH * bpp / 8 * ((naxis == 3) ? 3 : 1);
-                int oneFrameSize     = subW * subH * bpp / 8;
-
-                int lineW  = subW * bpp / 8;
-
-                LOGF_DEBUG("Subframing... subFrameSize: %d - oneFrameSize: %d - subX: %d - subY: %d - subW: %d - subH: %d",
-                           subFrameSize, oneFrameSize,
-                           subX, subY, subW, subH);
-
-                if (naxis == 2)
+                if (CaptureFormatSP.findOnSwitchIndex() == CAPTURE_DNG)
                 {
-                    // JM 2020-08-29: Using memmove since regions are overlaping
-                    // as proposed by Camiel Severijns on INDI forums.
-                    for (int i = subY; i < subY + subH; i++)
-                        memmove(memptr + (i - subY) * lineW, memptr + (i * w + subX) * bpp / 8, lineW);
+                    if (!processRAW(filename, &memptr, &memsize, &naxis, &w, &h, &bpp, bayer_pattern))
+                    {
+                        LOG_ERROR("Exposure failed to parse raw image.");
+                        PrimaryCCD.setExposureFailed();
+                        m_fastExposureActive = false;
+                        app.StopCamera();
+                        app.Teardown();
+                        app.CloseCamera();
+                        unlink(filename);
+                        return;
+                    }
+
+                    SetCCDCapability(GetCCDCapability() | CCD_HAS_BAYER);
+                    BayerTP[2].setText(bayer_pattern);
+                    BayerTP.apply();
+                    m_csi_format_packed = options->Get().mode.packed;
+                    m_bit_depth = options->Get().mode.bit_depth;
+                    m_pixel_format = bayerToPixelFormat(bayer_pattern);
+                    LOGF_INFO("Acquired image, mode: %s%d%s", bayer_pattern, m_bit_depth, m_csi_format_packed ? "P" : "U");
+
+                    auto bl = frameMetadata.get(controls::SensorBlackLevels);
+                    if (bl)
+                    {
+                        if (m_pixel_format == INDI_MONO)
+                        {
+                            int black_level = static_cast<int>((*bl)[0] * (1 << m_bit_depth) / 65536.0);
+                            for (int i = 0; i < 4; i++)
+                            {
+                                m_black_levels[i] = black_level;
+                            }
+                            LOGF_INFO("Black level: %d", black_level);
+                        }
+                        else
+                        {
+                            for (int i = 0; i < 4; i++)
+                            {
+                                m_black_levels[i] = static_cast<int>((*bl)[i] * (1 << m_bit_depth) / 65536.0);
+                            }
+                            LOGF_INFO("Black levels: %d,%d,%d,%d", m_black_levels[0], m_black_levels[1], m_black_levels[2], m_black_levels[3]);
+                        }
+                    }
+                    else {
+                        LOG_WARN("no black level found, using default");
+                    }
+                    auto st = frameMetadata.get(controls::SensorTemperature);
+                    if (st)
+                    {
+                        LOGF_INFO("Sensor temp: %0.2f", *st);
+                        TemperatureNP[0].setValue(*st);
+                        TemperatureNP.setState(IPS_OK);
+                        TemperatureNP.apply();
+                    }
                 }
                 else
                 {
-                    uint8_t * subR = memptr;
-                    uint8_t * subG = memptr + oneFrameSize;
-                    uint8_t * subB = memptr + oneFrameSize * 2;
-
-                    uint8_t * startR = memptr;
-                    uint8_t * startG = memptr + (w * h * bpp / 8);
-                    uint8_t * startB = memptr + (w * h * bpp / 8 * 2);
-
-                    for (int i = subY; i < subY + subH; i++)
+                    if (!processJPEG(filename, &memptr, &memsize, &naxis, &w, &h))
                     {
-                        memcpy(subR + (i - subY) * lineW, startR + (i * w + subX) * bpp / 8, lineW);
-                        memcpy(subG + (i - subY) * lineW, startG + (i * w + subX) * bpp / 8, lineW);
-                        memcpy(subB + (i - subY) * lineW, startB + (i * w + subX) * bpp / 8, lineW);
+                        LOG_ERROR("Exposure failed to parse jpeg.");
+                        PrimaryCCD.setExposureFailed();
+                        m_fastExposureActive = false;
+                        app.StopCamera();
+                        app.Teardown();
+                        app.CloseCamera();
+                        unlink(filename);
+                        return;
                     }
+
+                    LOGF_DEBUG("read_jpeg: memsize (%d) naxis (%d) w (%d) h (%d) bpp (%d)", memsize, naxis, w, h, bpp);
+
+                    SetCCDCapability(GetCCDCapability() & ~CCD_HAS_BAYER);
                 }
 
-                PrimaryCCD.setFrameBuffer(memptr);
-                PrimaryCCD.setFrameBufferSize(memsize, false);
-                PrimaryCCD.setResolution(w, h);
-                PrimaryCCD.setFrame(subX, subY, subW, subH);
-                PrimaryCCD.setNAxis(naxis);
-                PrimaryCCD.setBPP(bpp);
+                PrimaryCCD.setImageExtension("fits");
 
-                // binning if needed
-                if(PrimaryCCD.getBinX() > 1)
-                    PrimaryCCD.binBayerFrame();
+                uint16_t subW = PrimaryCCD.getSubW();
+                uint16_t subH = PrimaryCCD.getSubH();
+
+                // If subframing is requested
+                // If either axis is less than the image resolution
+                // then we subframe, given the OTHER axis is within range as well.
+                if ( (subW > 0 && subH > 0) && ((subW < w && subH <= h) || (subH < h && subW <= w)))
+                {
+
+                    uint16_t subX = PrimaryCCD.getSubX();
+                    uint16_t subY = PrimaryCCD.getSubY();
+
+                    int subFrameSize     = subW * subH * bpp / 8 * ((naxis == 3) ? 3 : 1);
+                    int oneFrameSize     = subW * subH * bpp / 8;
+
+                    int lineW  = subW * bpp / 8;
+
+                    LOGF_DEBUG("Subframing... subFrameSize: %d - oneFrameSize: %d - subX: %d - subY: %d - subW: %d - subH: %d",
+                               subFrameSize, oneFrameSize,
+                               subX, subY, subW, subH);
+
+                    if (naxis == 2)
+                    {
+                        // JM 2020-08-29: Using memmove since regions are overlaping
+                        // as proposed by Camiel Severijns on INDI forums.
+                        for (int i = subY; i < subY + subH; i++)
+                            memmove(memptr + (i - subY) * lineW, memptr + (i * w + subX) * bpp / 8, lineW);
+                    }
+                    else
+                    {
+                        uint8_t * subR = memptr;
+                        uint8_t * subG = memptr + oneFrameSize;
+                        uint8_t * subB = memptr + oneFrameSize * 2;
+
+                        uint8_t * startR = memptr;
+                        uint8_t * startG = memptr + (w * h * bpp / 8);
+                        uint8_t * startB = memptr + (w * h * bpp / 8 * 2);
+
+                        for (int i = subY; i < subY + subH; i++)
+                        {
+                            memcpy(subR + (i - subY) * lineW, startR + (i * w + subX) * bpp / 8, lineW);
+                            memcpy(subG + (i - subY) * lineW, startG + (i * w + subX) * bpp / 8, lineW);
+                            memcpy(subB + (i - subY) * lineW, startB + (i * w + subX) * bpp / 8, lineW);
+                        }
+                    }
+
+                    PrimaryCCD.setFrameBuffer(memptr);
+                    PrimaryCCD.setFrameBufferSize(memsize, false);
+                    PrimaryCCD.setResolution(w, h);
+                    PrimaryCCD.setFrame(subX, subY, subW, subH);
+                    PrimaryCCD.setNAxis(naxis);
+                    PrimaryCCD.setBPP(bpp);
+
+                    // binning if needed
+                    if(PrimaryCCD.getBinX() > 1)
+                        PrimaryCCD.binBayerFrame();
+                }
+                else
+                {
+                    if (PrimaryCCD.getSubW() != 0 && (w > PrimaryCCD.getSubW() || h > PrimaryCCD.getSubH()))
+                        LOGF_WARN("Camera image size (%dx%d) is less than requested size (%d,%d). Purge configuration and update frame size to match camera size.",
+                                  w, h, PrimaryCCD.getSubW(), PrimaryCCD.getSubH());
+
+                    PrimaryCCD.setFrameBuffer(memptr);
+                    PrimaryCCD.setFrameBufferSize(memsize, false);
+                    PrimaryCCD.setResolution(w, h);
+                    PrimaryCCD.setFrame(0, 0, w, h);
+                    PrimaryCCD.setNAxis(naxis);
+                    PrimaryCCD.setBPP(bpp);
+
+                    // binning if needed
+                    if(PrimaryCCD.getBinX() > 1)
+                        PrimaryCCD.binBayerFrame();
+                }
             }
             else
             {
-                if (PrimaryCCD.getSubW() != 0 && (w > PrimaryCCD.getSubW() || h > PrimaryCCD.getSubH()))
-                    LOGF_WARN("Camera image size (%dx%d) is less than requested size (%d,%d). Purge configuration and update frame size to match camera size.",
-                              w, h, PrimaryCCD.getSubW(), PrimaryCCD.getSubH());
+                int fd = open(filename, O_RDONLY);
+                struct stat sb;
 
-                PrimaryCCD.setFrameBuffer(memptr);
-                PrimaryCCD.setFrameBufferSize(memsize, false);
-                PrimaryCCD.setResolution(w, h);
-                PrimaryCCD.setFrame(0, 0, w, h);
-                PrimaryCCD.setNAxis(naxis);
-                PrimaryCCD.setBPP(bpp);
-
-                // binning if needed
-                if(PrimaryCCD.getBinX() > 1)
-                    PrimaryCCD.binBayerFrame();
-            }
-        }
-        else
-        {
-            int fd = open(filename, O_RDONLY);
-            struct stat sb;
-
-            // Get file size
-            if (fstat(fd, &sb) == -1)
-            {
-                LOGF_ERROR("Error opening file %s: %s", filename, strerror(errno));
-                PrimaryCCD.setExposureFailed();
-                app.StopCamera();
-                app.Teardown();
-                app.CloseCamera();
-                close(fd);
-                return;
-            }
-
-            // Copy file to memory using mmap
-            memsize = sb.st_size;
-            // Guard CCD Buffer content until we finish copying mmap buffer to it
-            std::unique_lock<std::mutex> guard(ccdBufferLock);
-            // If CCD Buffer size is different, allocate memory to file size
-            if (PrimaryCCD.getFrameBufferSize() != static_cast<int>(memsize))
-            {
-                PrimaryCCD.setFrameBufferSize(memsize);
-                memptr = PrimaryCCD.getFrameBuffer();
-            }
-            // mmap crashes randomly for some reason
-            if(0)
-            {
-
-                void *mmap_mem = mmap(nullptr, memsize, PROT_READ, MAP_PRIVATE, fd, 0);
-                if (mmap_mem == nullptr)
+                // Get file size
+                if (fstat(fd, &sb) == -1)
                 {
-                    LOGF_ERROR("Error reading file %s: %s", filename, strerror(errno));
+                    LOGF_ERROR("Error opening file %s: %s", filename, strerror(errno));
                     PrimaryCCD.setExposureFailed();
+                    m_fastExposureActive = false;
                     app.StopCamera();
                     app.Teardown();
                     app.CloseCamera();
@@ -445,32 +507,108 @@ void INDILibCamera::workerExposure(const std::atomic_bool &isAboutToQuit, float 
                     return;
                 }
 
-                // Copy mmap buffer to ccd buffer
-                memcpy(memptr, mmap_mem, memsize);
+                // Copy file to memory using mmap
+                memsize = sb.st_size;
+                // Guard CCD Buffer content until we finish copying mmap buffer to it
+                std::unique_lock<std::mutex> guard(ccdBufferLock);
+                // If CCD Buffer size is different, allocate memory to file size
+                if (PrimaryCCD.getFrameBufferSize() != static_cast<int>(memsize))
+                {
+                    PrimaryCCD.setFrameBufferSize(memsize);
+                    memptr = PrimaryCCD.getFrameBuffer();
+                }
+                // mmap crashes randomly for some reason
+                if(0)
+                {
 
-                // Release mmap memory
-                munmap(mmap_mem, memsize);
+                    void *mmap_mem = mmap(nullptr, memsize, PROT_READ, MAP_PRIVATE, fd, 0);
+                    if (mmap_mem == nullptr)
+                    {
+                        LOGF_ERROR("Error reading file %s: %s", filename, strerror(errno));
+                        PrimaryCCD.setExposureFailed();
+                        m_fastExposureActive = false;
+                        app.StopCamera();
+                        app.Teardown();
+                        app.CloseCamera();
+                        close(fd);
+                        return;
+                    }
+
+                    // Copy mmap buffer to ccd buffer
+                    memcpy(memptr, mmap_mem, memsize);
+
+                    // Release mmap memory
+                    munmap(mmap_mem, memsize);
+                }
+                else
+                {
+                    ssize_t bytesRead = read(fd, memptr, memsize);
+                    if (bytesRead == -1 || static_cast<size_t>(bytesRead) < memsize)
+                    {
+                        LOGF_ERROR("Error reading file %s: %s or incomplete read (%zd/%zu bytes)", filename, strerror(errno), bytesRead, memsize);
+                        PrimaryCCD.setExposureFailed();
+                        m_fastExposureActive = false;
+                        app.StopCamera();
+                        app.Teardown();
+                        app.CloseCamera();
+                        close(fd);
+                        return;
+                    }
+                }
+                // Close file
+                close(fd);
+                // Set extension (eg. cr2..etc)
+                PrimaryCCD.setImageExtension(strchr(filename, '.') + 1);
+                // We are ready to unlock
+                guard.unlock();
             }
-            else
+
+            // Signal fast-exposure active before ExposureComplete so that StartExposure,
+            // called from the processFastExposure detached thread, routes to our CV
+            // instead of spawning a new worker.
+            m_fastExposureActive = (FastExposureToggleSP[INDI_ENABLED].getState() == ISS_ON);
+            if (m_fastExposureActive)
             {
-                read(fd, memptr, memsize);
+                // Preset the timing baseline so processFastExposure sees m_UploadTime ≈ 0.
+                // The camera already started the next frame when we released the payload
+                // buffer earlier; the real inter-frame cost is app.Wait(), not processRAW.
+                FastExposureToggleStartup = std::chrono::system_clock::now() -
+                    std::chrono::milliseconds(static_cast<long long>(duration * 950));
             }
-            // Close file
-            close(fd);
-            // Set extension (eg. cr2..etc)
-            PrimaryCCD.setImageExtension(strchr(filename, '.') + 1);
-            // We are ready to unlock
-            guard.unlock();
+            ExposureComplete(&PrimaryCCD);
+        }
+        catch (std::exception &e)
+        {
+            LOGF_ERROR("Error saving image: %s", e.what());
+            PrimaryCCD.setExposureFailed();
+            m_fastExposureActive = false;
+            app.StopCamera();
+            app.Teardown();
+            app.CloseCamera();
+            return;
         }
 
-        ExposureComplete(&PrimaryCCD);
-    }
-    catch (std::exception &e)
-    {
-        LOGF_ERROR("Error saving image: %s", e.what());
-        PrimaryCCD.setExposureFailed();
-    }
+        // Decide whether to loop for the next frame
+        if (m_fastExposureActive)
+        {
+            // Wait for StartExposure to signal us. processFastExposure calls StartExposure
+            // before doing any encoding/upload, so the signal arrives within ~100ms.
+            std::unique_lock<std::mutex> lock(m_fastExposureMutex);
+            bool gotSignal = m_fastExposureCV.wait_for(lock,
+                std::chrono::milliseconds(static_cast<long long>(duration * 1000) + 3000),
+                [this]() { return m_fastExposureSignals > 0 || !m_fastExposureActive; });
+            if (gotSignal && m_fastExposureSignals > 0)
+                m_fastExposureSignals--;
+            else
+                keepCapturing = false;
+        }
+        else
+        {
+            keepCapturing = false;
+        }
+    }  // end while keepCapturing
 
+    m_fastExposureActive = false;
     app.StopCamera();
     app.Teardown();
     app.CloseCamera();
@@ -522,46 +660,216 @@ void INDILibCamera::initSwitch(INDI::PropertySwitch &switchSP, int n, const char
 
 }
 
+/**
+ * Get libcamera Camera controls (which we map to INDI Properties)
+ * by instantiating an RpiCam instance and acquiring a Camera instance.
+ * 'sane' defaults are returned if it fails to find or acquire the cam.
+ */
+RpiCamProperties INDILibCamera::getAvailableCamProperties()
+{
+    RpiCamProperties props; // Initialized with defaults
+
+    // now get the controls by instantiating an app instance and 
+    // acquiring a libcamera Camera instance
+    RPiCamINDIApp tempApp;
+    int argc = 1;
+    char *argv[] = { (char*)"indi_libcamera_ccd" };
+    auto options = tempApp.GetOptions();
+    
+    if (!options->Parse(argc, argv)) {
+        LOG_WARN("Failed to parse temporary app options, using default camera properties");
+        return props;
+    }
+    
+    auto cameras = tempApp.GetCameras();
+    
+    if (m_CameraIndex >= cameras.size() || !cameras[m_CameraIndex])
+    {
+        LOGF_WARN("Camera index %zu not available, using default camera properties", m_CameraIndex);
+        return props;
+    }
+    
+    auto cam = cameras[m_CameraIndex];
+    
+    if (cam->acquire() != 0)
+    {
+        LOGF_WARN("Failed to acquire camera %zu, using default camera properties", m_CameraIndex);
+        return props;
+    }
+    
+    auto config = cam->generateConfiguration({ libcamera::StreamRole::StillCapture });
+    if (!config)
+    {
+        LOGF_WARN("Failed to generate configuration for camera %zu, using default camera properties", m_CameraIndex);
+        cam->release();
+        return props;
+    }
+    
+    config->validate();
+    cam->configure(config.get());
+    // Save the negotiated StillCapture stream size.
+    // This is used to initialize the CCD geometry during Connect().
+    m_CaptureWidth = config->at(0).size.width;
+    m_CaptureHeight = config->at(0).size.height;
+    
+    const auto &controls = cam->controls();
+    
+    auto bright_it = controls.find(&libcamera::controls::Brightness);
+    if (bright_it != controls.end())
+    {
+        props.brightness.min = bright_it->second.min().get<float>();
+        props.brightness.max = bright_it->second.max().get<float>();
+        props.brightness.def = bright_it->second.def().get<float>();
+        LOGF_DEBUG("Found Brightness control: min=%.2f max=%.2f def=%.2f",
+                    props.brightness.min, props.brightness.max, props.brightness.def);
+    }
+    
+    auto contrast_it = controls.find(&libcamera::controls::Contrast);
+    if (contrast_it != controls.end())
+    {
+        props.contrast.min = contrast_it->second.min().get<float>();
+        props.contrast.max = contrast_it->second.max().get<float>();
+        props.contrast.def = contrast_it->second.def().get<float>();
+        LOGF_DEBUG("Found Contrast control: min=%.2f max=%.2f def=%.2f",
+                    props.contrast.min, props.contrast.max, props.contrast.def);
+    }
+
+    auto sat_it = controls.find(&libcamera::controls::Saturation);
+    if (sat_it != controls.end())
+    {
+        props.saturation.min = sat_it->second.min().get<float>();
+        props.saturation.max = sat_it->second.max().get<float>();
+        props.saturation.def = sat_it->second.def().get<float>();
+        LOGF_DEBUG("Found Saturation control: min=%.2f max=%.2f def=%.2f",
+                    props.saturation.min, props.saturation.max, props.saturation.def);
+    }
+    
+    auto sharp_it = controls.find(&libcamera::controls::Sharpness);
+    if (sharp_it != controls.end())
+    {
+        props.sharpness.min = sharp_it->second.min().get<float>();
+        props.sharpness.max = sharp_it->second.max().get<float>();
+        props.sharpness.def = sharp_it->second.def().get<float>();
+        LOGF_DEBUG("Found Sharpness control: min=%.2f max=%.2f def=%.2f",
+                    props.sharpness.min, props.sharpness.max, props.sharpness.def);
+    }
+    
+    auto gain_it = controls.find(&libcamera::controls::AnalogueGain);
+    if (gain_it != controls.end())
+    {
+        props.gain.min = gain_it->second.min().get<float>();
+        props.gain.max = gain_it->second.max().get<float>();
+        props.gain.def = gain_it->second.def().get<float>();
+        LOGF_DEBUG("Found AnalogueGain control: min=%.2f max=%.2f def=%.2f",
+                    props.gain.min, props.gain.max, props.gain.def);
+    }
+    
+    // ColourGains - special handling
+    // ColourGains is Span<const float, 2> - array of [red_gain, blue_gain]
+    auto cg_it = controls.find(&libcamera::controls::ColourGains);
+    if (cg_it != controls.end())
+    {
+        const auto& min_val = cg_it->second.min();
+        const auto& max_val = cg_it->second.max();
+        props.colourGains.min = min_val.get<float>();
+        props.colourGains.max = max_val.get<float>();
+        props.colourGains.def = 1.0f;
+        LOGF_DEBUG("Found ColourGains control: min=%.2f max=%.2f def=%.2f",
+                    props.colourGains.min, props.colourGains.max, props.colourGains.def);
+    }
+            
+    auto exp_it = controls.find(&libcamera::controls::ExposureTime);
+    if (exp_it != controls.end())
+    {
+        props.exposureTime.min = static_cast<float>(exp_it->second.min().get<int32_t>()) / 1000000.0f; // convert from us to s
+        props.exposureTime.max = static_cast<float>(exp_it->second.max().get<int32_t>()) / 1000000.0f;
+        props.exposureTime.def = static_cast<float>(exp_it->second.def().get<int32_t>()) / 1000000.0f;
+        LOGF_DEBUG("Found ExposureTime control: min=%.6f max=%.6f def=%.6f",
+                    props.exposureTime.min, props.exposureTime.max, props.exposureTime.def);
+    }
+
+    auto ev_it = controls.find(&libcamera::controls::ExposureValue);
+    if (ev_it != controls.end())
+    {
+        props.exposureValue.min = ev_it->second.min().get<float>();
+        props.exposureValue.max = ev_it->second.max().get<float>();
+        props.exposureValue.def = ev_it->second.def().get<float>();
+        LOGF_DEBUG("Found ExposureValue control: min=%.2f max=%.2f def=%.2f",
+                    props.exposureValue.min, props.exposureValue.max, props.exposureValue.def);
+    }
+    
+    cam->release();
+    
+    return props;
+}
+
 bool INDILibCamera::initProperties()
 {
+    LOGF_DEBUG("Reading available properties from %s", getDeviceName());
+    RpiCamProperties props = getAvailableCamProperties();
+
+    LOGF_DEBUG("Initializing properties for %s", getDeviceName());
     INDI::CCD::initProperties();
 
-    PrimaryCCD.setMinMaxStep("CCD_EXPOSURE", "CCD_EXPOSURE_VALUE", 0, 3600, 1, false);
+    LibCameraVersionTP[0].fill("VERSION", "Version", libcamera::CameraManager::version().c_str());
+    LibCameraVersionTP.fill(getDeviceName(), "LIBCAMERA_VERSION", "LibCamera", INFO_TAB, IP_RO, 60, IPS_IDLE);
+    registerProperty(LibCameraVersionTP);
+
+    // Temperature is read-only (sensor temp, no cooler control).
+    // IP_RO causes the base class to include CCD-TEMP in FITS automatically.
+    TemperatureNP.setPermission(IP_RO);
+
+    PrimaryCCD.setMinMaxStep("CCD_EXPOSURE", "CCD_EXPOSURE_VALUE", props.exposureTime.min, props.exposureTime.max, 1, false);
     PrimaryCCD.setMinMaxStep("CCD_BINNING", "HOR_BIN", 1, 4, 1, false);
     PrimaryCCD.setMinMaxStep("CCD_BINNING", "VER_BIN", 1, 4, 1, false);
 
     const char *IMAGE_CONTROLS_TAB = MAIN_CONTROL_TAB;
-    AdjustExposureModeSP.fill(getDeviceName(), "ExposureMode", "Exposure Mode", IMAGE_CONTROLS_TAB, IP_RW, ISR_1OFMANY, 60,
-                              IPS_IDLE);
+    
+    AdjustExposureModeSP.fill(getDeviceName(), "ExposureMode", "Exposure Mode", IMAGE_CONTROLS_TAB, 
+                              IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
     const char *exposureModes[] = {"normal", "sport", "short", "long", "custom"};
     initSwitch(AdjustExposureModeSP, 5, exposureModes);
 
-    AdjustAwbModeSP.fill(getDeviceName(), "AwbMode", "Awb Mode", IMAGE_CONTROLS_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
-    const char *awbModes[] = { "auto", "normal", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy", "custom"};
+    AdjustAwbModeSP.fill(getDeviceName(), "AwbMode", "Awb Mode", IMAGE_CONTROLS_TAB, 
+                         IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+    const char *awbModes[] = {"auto", "normal", "incandescent", "tungsten", "fluorescent", 
+                              "indoor", "daylight", "cloudy", "custom"};
     initSwitch(AdjustAwbModeSP, 9, awbModes);
 
-    AdjustMeteringModeSP.fill(getDeviceName(), "MeteringMode", "Metering Mode", IMAGE_CONTROLS_TAB, IP_RW, ISR_1OFMANY, 60,
-                              IPS_IDLE);
-    const char *meteringModes[] = { "centre", "spot", "average", "matrix", "custom"};
+    AdjustMeteringModeSP.fill(getDeviceName(), "MeteringMode", "Metering Mode", IMAGE_CONTROLS_TAB, 
+                              IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+    const char *meteringModes[] = {"centre", "spot", "average", "matrix", "custom"};
     initSwitch(AdjustMeteringModeSP, 5, meteringModes);
 
-    AdjustDenoiseModeSP.fill(getDeviceName(), "DenoiseMode", "Denoise Mode", IMAGE_CONTROLS_TAB, IP_RW, ISR_1OFMANY, 60,
-                             IPS_IDLE);
-    const char *denoiseModes[] = { "off", "cdn_off", "cdn_fast", "cdn_hq"};
+    AdjustDenoiseModeSP.fill(getDeviceName(), "DenoiseMode", "Denoise Mode", IMAGE_CONTROLS_TAB, 
+                             IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+    const char *denoiseModes[] = {"off", "cdn_off", "cdn_fast", "cdn_hq"};
     initSwitch(AdjustDenoiseModeSP, 4, denoiseModes);
 
-    AdjustmentNP[AdjustBrightness].fill("Brightness", "Brightness", "%.2f", -1.00, 1.00, 0.1, 0.00);
-    AdjustmentNP[AdjustContrast].fill("Contrast", "Contrast", "%.2f", 0.00, 2.00, 0.1, 1.00);
-    AdjustmentNP[AdjustSaturation].fill("Saturation", "Saturation", "%.2f", 0.00, 1.00, 0.1, 1.00);
-    AdjustmentNP[AdjustSharpness].fill("Sharpness", "Sharpness", "%.2f", 0.00, 16.00, 1.00, 1.00);
+    // Use extracted properties for ranges
+    AdjustmentNP[AdjustBrightness].fill("Brightness", "Brightness", "%.2f", 
+                                        props.brightness.min, props.brightness.max, 0.1, props.brightness.def);
+    AdjustmentNP[AdjustContrast].fill("Contrast", "Contrast", "%.2f", 
+                                      props.contrast.min, props.contrast.max, 0.1, props.contrast.def);
+    AdjustmentNP[AdjustSaturation].fill("Saturation", "Saturation", "%.2f", 
+                                        props.saturation.min, props.saturation.max, 0.1, props.saturation.def);
+    AdjustmentNP[AdjustSharpness].fill("Sharpness", "Sharpness", "%.2f", 
+                                       props.sharpness.min, props.sharpness.max, 1.00, props.sharpness.def);
     AdjustmentNP[AdjustQuality].fill("Quality", "Quality", "%.2f", 0.00, 100.00, 1.00, 100.00);
-    AdjustmentNP[AdjustExposureValue].fill("ExposureValue", "Exposure Value", "%.2f", -8.00, 8.00, .25, 0.00);
-    AdjustmentNP[AdjustAwbRed].fill("AwbRed", "AWB Red", "%.2f", 0.00, 2.00, .1, 0.00);
-    AdjustmentNP[AdjustAwbBlue].fill("AwbBlue", "AWB Blue", "%.2f", 0.00, 2.00, .1, 0.00);
+    AdjustmentNP[AdjustExposureValue].fill("ExposureValue", "Exposure Value", "%.2f", 
+                                           props.exposureValue.min, props.exposureValue.max, .25, props.exposureValue.def);
+    AdjustmentNP[AdjustAwbRed].fill("AwbRed", "AWB Red", "%.2f", 
+                                    props.colourGains.min, props.colourGains.max, .1, props.colourGains.def);
+    AdjustmentNP[AdjustAwbBlue].fill("AwbBlue", "AWB Blue", "%.2f", 
+                                     props.colourGains.min, props.colourGains.max, .1, props.colourGains.def);
     AdjustmentNP.fill(getDeviceName(), "Adjustments", "Adjustments", IMAGE_CONTROLS_TAB, IP_RW, 60, IPS_IDLE);
 
-    GainNP[0].fill("GAIN", "Gain", "%.2f", 0.00, 100.00, 1.00, 0.00);
+    GainNP[0].fill("GAIN", "Gain", "%.2f", props.gain.min, props.gain.max, 1.00, props.gain.def);
     GainNP.fill(getDeviceName(), "CCD_GAIN", "Gain", IMAGE_CONTROLS_TAB, IP_RW, 60, IPS_IDLE);
+
+    GainConversionSP[0].fill("LCG", "Dynamic Range (LCG)", ISS_ON);
+    GainConversionSP[1].fill("HCG", "Low Noise (HCG)", ISS_OFF);
+    GainConversionSP.fill(getDeviceName(), "GAIN_CONVERSION", "Gain Conversion", IMAGE_CONTROLS_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
 
     uint32_t cap = 0;
     cap |= CCD_HAS_BAYER;
@@ -589,6 +897,7 @@ bool INDILibCamera::initProperties()
 /////////////////////////////////////////////////////////////////////////////
 bool INDILibCamera::updateProperties()
 {
+    LOGF_DEBUG("Updating properties for %s", getDeviceName());
     INDI::CCD::updateProperties();
 
     if (isConnected())
@@ -596,8 +905,17 @@ bool INDILibCamera::updateProperties()
         // Setup camera
         setup();
 
+        defineProperty(TemperatureNP);
         defineProperty(AdjustmentNP);
         defineProperty(GainNP);
+
+        GainConversionMode currentMode;
+        if (readGainConversionMode(currentMode))
+        {
+            defineProperty(GainConversionSP);
+            updateGainConversionUI();
+        }
+
         defineProperty(AdjustExposureModeSP);
         defineProperty(AdjustAwbModeSP);
         defineProperty(AdjustMeteringModeSP);
@@ -605,8 +923,10 @@ bool INDILibCamera::updateProperties()
     }
     else
     {
+        deleteProperty(TemperatureNP);
         deleteProperty(AdjustmentNP);
         deleteProperty(GainNP);
+        deleteProperty(GainConversionSP);
         deleteProperty(AdjustExposureModeSP);
         deleteProperty(AdjustAwbModeSP);
         deleteProperty(AdjustMeteringModeSP);
@@ -621,40 +941,46 @@ bool INDILibCamera::updateProperties()
 /////////////////////////////////////////////////////////////////////////////
 void INDILibCamera::configureStillOptions(StillOptions *options, double duration)
 {
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::duration<double>(duration * 1000000));
     TimeVal<std::chrono::microseconds> tv;
     tv.set(std::to_string(duration) + "s");
 
-    int argc = 0;
-    char *argv[] = {};
+    int argc = 1;
+    char *argv[] = { (char*)"indi_libcamera_ccd", nullptr };
+    if (isDebug())
+    {
+        argv[1] = (char*)"-v";
+        argc = 2;
+    }
     options->Parse(argc, argv);
 
-    options->camera = m_CameraIndex;
-    options->nopreview = true;
-    options->immediate = true;
-    options->quality = 100;
-    options->restart = true;
-    options->thumb_quality = 0;
-    options->shutter = tv;
+    options->Set().camera = m_CameraIndex;
+    options->Set().nopreview = true;
+    options->Set().immediate = true;
+    options->Set().quality = 100;
+    options->Set().restart = 0; // restart is unsigned int, not bool
+    options->Set().thumb_width = 0; // thumb_quality is now thumb_width, thumb_height, thumb_quality
+    options->Set().thumb_height = 0;
+    options->Set().thumb_quality = 0;
+    options->Set().shutter = tv;
 
-    options->brightness = AdjustmentNP[AdjustBrightness].getValue();
-    options->contrast = AdjustmentNP[AdjustContrast].getValue();
-    options->saturation = AdjustmentNP[AdjustSaturation].getValue();
-    options->sharpness = AdjustmentNP[AdjustSharpness].getValue();
-    options->quality = AdjustmentNP[AdjustQuality].getValue();
-    options->ev = AdjustmentNP[AdjustExposureValue].getValue();
-    options->awb_gain_r = AdjustmentNP[AdjustAwbRed].getValue();
-    options->awb_gain_b = AdjustmentNP[AdjustAwbBlue].getValue();
+    options->Set().brightness = AdjustmentNP[AdjustBrightness].getValue();
+    options->Set().contrast = AdjustmentNP[AdjustContrast].getValue();
+    options->Set().saturation = AdjustmentNP[AdjustSaturation].getValue();
+    options->Set().sharpness = AdjustmentNP[AdjustSharpness].getValue();
+    options->Set().quality = AdjustmentNP[AdjustQuality].getValue();
+    options->Set().ev = AdjustmentNP[AdjustExposureValue].getValue();
+    options->Set().awb_gain_r = AdjustmentNP[AdjustAwbRed].getValue();
+    options->Set().awb_gain_b = AdjustmentNP[AdjustAwbBlue].getValue();
 
-    options->gain = GainNP[0].getValue();
+    options->Set().gain = GainNP[0].getValue();
 
-    options->exposure_index = AdjustExposureModeSP.findOnSwitchIndex();
-    options->awb_index = AdjustAwbModeSP.findOnSwitchIndex();
-    options->metering_index = AdjustMeteringModeSP.findOnSwitchIndex();
-    options->denoise = AdjustDenoiseModeSP.findOnSwitch()->getName();
+    options->Set().exposure_index = AdjustExposureModeSP.findOnSwitchIndex();
+    options->Set().awb_index = AdjustAwbModeSP.findOnSwitchIndex();
+    options->Set().metering_index = AdjustMeteringModeSP.findOnSwitchIndex();
+    options->Set().denoise = AdjustDenoiseModeSP.findOnSwitch()->getName();
 
-    options->width = PrimaryCCD.getSubW();
-    options->height = PrimaryCCD.getSubH();
+    options->Set().width = PrimaryCCD.getSubW();
+    options->Set().height = PrimaryCCD.getSubH();
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -662,30 +988,35 @@ void INDILibCamera::configureStillOptions(StillOptions *options, double duration
 /////////////////////////////////////////////////////////////////////////////
 void INDILibCamera::configureVideoOptions(VideoOptions *options, double framerate)
 {
-    int argc = 0;
+    int argc = 1;
+    char *argv[] = { (char*)"indi_libcamera_ccd", nullptr };
+    if (isDebug())
+    {
+        argv[1] = (char*)"-v";
+        argc = 2;
+    }
     INDI_UNUSED(framerate);
-    char *argv[] = {};
     options->Parse(argc, argv);
 
-    options->camera = m_CameraIndex;
-    options->nopreview = true;
+    options->Set().camera = m_CameraIndex;
+    options->Set().nopreview = true;
 
-    options->codec = "mjpeg";
-    options->brightness = AdjustmentNP[AdjustBrightness].getValue();
-    options->contrast = AdjustmentNP[AdjustContrast].getValue();
-    options->saturation = AdjustmentNP[AdjustSaturation].getValue();
-    options->sharpness = AdjustmentNP[AdjustSharpness].getValue();
-    options->quality = AdjustmentNP[AdjustQuality].getValue();
-    options->ev = AdjustmentNP[AdjustExposureValue].getValue();
-    options->awb_gain_r = AdjustmentNP[AdjustAwbRed].getValue();
-    options->awb_gain_b = AdjustmentNP[AdjustAwbBlue].getValue();
+    options->Set().codec = "mjpeg";
+    options->Set().brightness = AdjustmentNP[AdjustBrightness].getValue();
+    options->Set().contrast = AdjustmentNP[AdjustContrast].getValue();
+    options->Set().saturation = AdjustmentNP[AdjustSaturation].getValue();
+    options->Set().sharpness = AdjustmentNP[AdjustSharpness].getValue();
+    options->Set().quality = AdjustmentNP[AdjustQuality].getValue();
+    options->Set().ev = AdjustmentNP[AdjustExposureValue].getValue();
+    options->Set().awb_gain_r = AdjustmentNP[AdjustAwbRed].getValue();
+    options->Set().awb_gain_b = AdjustmentNP[AdjustAwbBlue].getValue();
 
-    options->gain = GainNP[0].getValue();
+    options->Set().gain = GainNP[0].getValue();
 
-    options->exposure_index = AdjustExposureModeSP.findOnSwitchIndex();
-    options->awb_index = AdjustAwbModeSP.findOnSwitchIndex();
-    options->metering_index = AdjustMeteringModeSP.findOnSwitchIndex();
-    options->denoise = AdjustDenoiseModeSP.findOnSwitch()->getName();
+    options->Set().exposure_index = AdjustExposureModeSP.findOnSwitchIndex();
+    options->Set().awb_index = AdjustAwbModeSP.findOnSwitchIndex();
+    options->Set().metering_index = AdjustMeteringModeSP.findOnSwitchIndex();
+    options->Set().denoise = AdjustDenoiseModeSP.findOnSwitch()->getName();
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -701,11 +1032,31 @@ void INDILibCamera::default_signal_handler(int signal_number)
 /////////////////////////////////////////////////////////////////////////////
 bool INDILibCamera::Connect()
 {
+    LOGF_INFO("Connecting to %s", getDeviceName());
 
-    auto pas = m_ControlList.get(properties::PixelArraySize);
-    // no idea why the IMX290 returns an uneven number of pixels, so just round down
-    auto width = 2.0 * (pas->width / 2);
-    auto height = pas->height;
+    // Use the negotiated StillCapture stream size when available.
+    // PixelArraySize describes the sensor array and may differ from
+    // the actual capture stream dimensions on some cameras.
+    uint32_t width = m_CaptureWidth;
+    uint32_t height = m_CaptureHeight;
+
+    if (width == 0 || height == 0)
+    {
+        auto pas = m_ControlList.get(properties::PixelArraySize);
+
+        if (pas)
+        {
+            // no idea why the IMX290 returns an uneven number of pixels, so just round down
+            width = 2 * (pas->width / 2);
+            height = pas->height;
+            LOG_WARN("Negotiated stream size unavailable, falling back to PixelArraySize.");
+        }
+        else
+        {
+            LOG_ERROR("Unable to determine CCD size.");
+            return false;
+        }
+    }
 
     PrimaryCCD.setResolution(width, height);
     UpdateCCDFrame(0, 0, width, height);
@@ -716,6 +1067,8 @@ bool INDILibCamera::Connect()
     PrimaryCCD.setPixelSize(ucsWidth, ucsHeight);
     PrimaryCCD.setBPP(8);
 
+    LOGF_INFO("Camera connected, pixel size: %.3f x %.3f um", ucsWidth, ucsHeight);
+
     return true;
 }
 
@@ -724,6 +1077,7 @@ bool INDILibCamera::Connect()
 /////////////////////////////////////////////////////////////////////////////
 bool INDILibCamera::Disconnect()
 {
+    LOGF_INFO("Disconnecting from %s", getDeviceName());
     m_Worker.quit();
     return true;
 }
@@ -769,21 +1123,19 @@ bool INDILibCamera::ISNewNumber(const char *dev, const char *name, double values
     {
         if (AdjustmentNP.isNameMatch(name))
         {
-            AdjustmentNP.update(values, names, n);
-            AdjustmentNP.setState(IPS_OK);
-            AdjustmentNP.apply();
-            saveConfig(AdjustmentNP);
-
-
-
+            updateProperty(AdjustmentNP, values, names, n, []()
+            {
+                return true;
+            }, true);
             return true;
         }
+        
         if (GainNP.isNameMatch(name))
         {
-            GainNP.update(values, names, n);
-            GainNP.setState(IPS_OK);
-            GainNP.apply();
-            saveConfig(GainNP);
+            updateProperty(GainNP, values, names, n, []()
+            {
+                return true;
+            }, true);
             return true;
         }
     }
@@ -801,42 +1153,64 @@ bool INDILibCamera::ISNewSwitch(const char *dev, const char *name, ISState * sta
         // Adjust Exposure Mode
         if (AdjustExposureModeSP.isNameMatch(name))
         {
-            AdjustExposureModeSP.update(states, names, n);
-            AdjustExposureModeSP.setState(IPS_OK);
-            AdjustExposureModeSP.apply();
-            saveConfig(AdjustExposureModeSP);
+            updateProperty(AdjustExposureModeSP, states, names, n, []()
+            {
+                return true;
+            }, true);
             return true;
         }
 
         // Adjust AWB Mode
         if (AdjustAwbModeSP.isNameMatch(name))
         {
-            AdjustAwbModeSP.update(states, names, n);
-            AdjustAwbModeSP.setState(IPS_OK);
-            AdjustAwbModeSP.apply();
-            saveConfig(AdjustAwbModeSP);
+            updateProperty(AdjustAwbModeSP, states, names, n, []()
+            {
+                return true;
+            }, true);
             return true;
         }
 
         // Adjust Metering MOde
         if (AdjustMeteringModeSP.isNameMatch(name))
         {
-            AdjustMeteringModeSP.update(states, names, n);
-            AdjustMeteringModeSP.setState(IPS_OK);
-            AdjustMeteringModeSP.apply();
-            saveConfig(AdjustMeteringModeSP);
+            updateProperty(AdjustMeteringModeSP, states, names, n, []()
+            {
+                return true;
+            }, true);
             return true;
         }
 
         // Denoise
         if (AdjustDenoiseModeSP.isNameMatch(name))
         {
-            AdjustDenoiseModeSP.update(states, names, n);
-            AdjustDenoiseModeSP.setState(IPS_OK);
-            AdjustDenoiseModeSP.apply();
-            saveConfig(AdjustDenoiseModeSP);
+            updateProperty(AdjustDenoiseModeSP, states, names, n, []()
+            {
+                return true;
+            }, true);
             return true;
         }
+
+        // Gain Conversion
+        if (GainConversionSP.isNameMatch(name))
+        {
+            updateProperty(GainConversionSP, states, names, n, [this, names]()
+            {
+                GainConversionMode mode =
+                    (strcmp(names[0], "HCG") == 0)
+                        ? GainConversionMode::LowNoise
+                        : GainConversionMode::DynamicRange;
+
+                if (!writeGainConversionMode(mode))
+                    return false;
+
+                updateGainConversionUI();
+
+                return true;
+            }, true);
+
+            return true;
+        }
+
     }
 
     return INDI::CCD::ISNewSwitch(dev, name, states, names, n);
@@ -849,6 +1223,15 @@ bool INDILibCamera::ISNewSwitch(const char *dev, const char *name, ISState * sta
 bool INDILibCamera::StartExposure(float duration)
 {
     Streamer->setPixelFormat(CaptureFormatSP.findOnSwitchIndex() == CAPTURE_JPG ? INDI_JPG : INDI_RGB);
+    PrimaryCCD.setExposureDuration(duration);
+    // If the fast-exposure loop is already running, signal it rather than spawning a new worker
+    if (m_fastExposureActive.load())
+    {
+        std::unique_lock<std::mutex> lock(m_fastExposureMutex);
+        m_fastExposureSignals++;
+        m_fastExposureCV.notify_one();
+        return true;
+    }
     m_Worker.start(std::bind(&INDILibCamera::workerExposure, this, std::placeholders::_1, duration));
     return true;
 }
@@ -859,6 +1242,13 @@ bool INDILibCamera::StartExposure(float duration)
 bool INDILibCamera::AbortExposure()
 {
     LOG_DEBUG("Aborting exposure...");
+    // Wake the fast-exposure loop so it can exit cleanly
+    {
+        std::unique_lock<std::mutex> lock(m_fastExposureMutex);
+        m_fastExposureActive = false;
+        m_fastExposureSignals = 0;
+        m_fastExposureCV.notify_all();
+    }
     m_Worker.quit();
     return true;
 }
@@ -941,8 +1331,28 @@ bool INDILibCamera::UpdateCCDBin(int binx, int biny)
 /////////////////////////////////////////////////////////////////////////////
 void INDILibCamera::addFITSKeywords(INDI::CCDChip * targetChip, std::vector<INDI::FITSRecord> &fitsKeywords)
 {
+    LOGF_DEBUG("Adding FITS keywords for %s", getDeviceName());
     INDI::CCD::addFITSKeywords(targetChip, fitsKeywords);
-    // TODO Add Gain
+    fitsKeywords.push_back({"GAIN", GainNP[0].getValue(), 3, "Gain"});
+    fitsKeywords.push_back({"CSI_BIT_DEPTH", static_cast<int64_t>(m_bit_depth), "CSI Bit Depth"});
+    fitsKeywords.push_back({"CSI_PACKED", m_csi_format_packed ? "P" : "U", "CSI Packed Format"});
+
+    float awb_gain_r = AdjustmentNP[AdjustAwbRed].getValue();
+    fitsKeywords.push_back({"WB_R", awb_gain_r, 3, "White Balance - Red"});
+    float awb_gain_b = AdjustmentNP[AdjustAwbBlue].getValue();
+    fitsKeywords.push_back({"WB_B", awb_gain_b, 3, "White Balance - Blue"});
+
+    std::string black_level_str;
+    if (m_pixel_format == INDI_MONO)
+    {
+        black_level_str = std::to_string(m_black_levels[0]);
+    } else {
+        black_level_str = std::to_string(m_black_levels[0]) + "," 
+            + std::to_string(m_black_levels[1]) + "," 
+            + std::to_string(m_black_levels[2]) + "," 
+            + std::to_string(m_black_levels[3]);
+    }
+    fitsKeywords.push_back({"BLACKLEVEL", black_level_str.c_str(), "CCD Black Levels"});
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1328,3 +1738,79 @@ INDI_PIXEL_FORMAT INDILibCamera::bayerToPixelFormat(const char *bayer)
 
     return INDI_MONO;
 }
+/////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////
+bool INDILibCamera::readGainConversionMode(GainConversionMode &mode) const
+{
+    std::ifstream file(HCG_SYSFS);
+
+    if (!file)
+        return false;
+
+    std::string value;
+    file >> value;
+
+    if (!value.empty() &&
+        (value[0] == 'Y' || value[0] == 'y'))
+    {
+        mode = GainConversionMode::LowNoise;
+    }
+    else
+    {
+        mode = GainConversionMode::DynamicRange;
+    }
+
+    return true;
+}
+
+void INDILibCamera::updateGainConversionUI()
+{
+    GainConversionMode mode;
+
+    if (!readGainConversionMode(mode))
+        return;
+
+    GainConversionSP.reset();
+
+    if (mode == GainConversionMode::LowNoise)
+        GainConversionSP[1].setState(ISS_ON);
+    else
+        GainConversionSP[0].setState(ISS_ON);
+
+    GainConversionSP.setState(IPS_OK);
+    GainConversionSP.apply();
+}
+
+bool INDILibCamera::writeGainConversionMode(GainConversionMode mode)
+{
+    std::ofstream file(HCG_SYSFS);
+
+    if (!file)
+    {
+        LOGF_ERROR("No write permission for %s. Configure write permissions or run indiserver with appropriate privileges.",
+                    HCG_SYSFS);
+        return false;
+    }
+
+    if (mode == GainConversionMode::LowNoise)
+        file << '1';
+    else
+        file << '0';
+
+    file.flush();
+
+    if (!file.good())
+    {
+        LOGF_ERROR("Failed writing to %s: %s",
+                    HCG_SYSFS,
+                    strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////

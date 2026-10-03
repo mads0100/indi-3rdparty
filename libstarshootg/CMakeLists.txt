@@ -1,14 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 project (libstarshootg)
 
-set (LIBSTARSHOOTG_VERSION "57.28200")
-set (LIBSTARSHOOTG_SOVERSION "57")
+set (LIBSTARSHOOTG_VERSION "60.32226")
+set (LIBSTARSHOOTG_SOVERSION "60")
 
 option(INDI_INSTALL_UDEV_RULES "Install UDEV rules" On)
 
 list (APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/")
 list (APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake_modules/")
 include (GNUInstallDirs)
+include(CMakeCommon)
 include (InstallImported)
 
 add_library (starshootg SHARED IMPORTED)
@@ -33,7 +34,7 @@ elseif (UNIX AND NOT WIN32)
 
   # Install udev rules
   if (INDI_INSTALL_UDEV_RULES)
-    set (UDEVRULES_INSTALL_DIR "/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
+    set (UDEVRULES_INSTALL_DIR "/usr/lib/udev/rules.d" CACHE STRING "Base directory for udev rules")
     install (FILES 99-starshootg.rules DESTINATION ${UDEVRULES_INSTALL_DIR})
   endif ()
 

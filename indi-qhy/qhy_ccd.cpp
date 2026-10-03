@@ -21,8 +21,10 @@
  */
 
 #include "qhy_ccd.h"
+#include "qhy_ccd_hotplug_handler.h"
 #include "config.h"
 #include <stream/streammanager.h>
+#include <hotplugmanager.h>
 
 #include <libnova/julian_day.h>
 #include <algorithm>
@@ -38,87 +40,17 @@
 
 static class Loader
 {
-        std::deque<std::unique_ptr<QHYCCD>> cameras;
+        std::shared_ptr<QHYCCDHotPlugHandler> hotPlugHandler;
     public:
         Loader()
         {
-#if !defined(USE_SIMULATION)
-            int ret = InitQHYCCDResource();
-
-            if (ret != QHYCCD_SUCCESS)
-            {
-                IDLog("Init QHYCCD SDK failed (%d)\n", ret);
-                return;
-            }
-#endif
-
-            //#if defined(__APPLE__)
-            //    char driverSupportPath[128];
-            //    if (getenv("INDIPREFIX") != nullptr)
-            //        sprintf(driverSupportPath, "%s/Contents/Resources", getenv("INDIPREFIX"));
-            //    else
-            //        strncpy(driverSupportPath, "/usr/local/lib/indi", 128);
-            //    strncat(driverSupportPath, "/DriverSupport/qhy/firmware", 128);
-            //    IDLog("QHY firmware path: %s\n", driverSupportPath);
-            //    OSXInitQHYCCDFirmware(driverSupportPath);
-            //#endif
-
-            // JM 2019-03-07: Use OSXInitQHYCCDFirmwareArray as recommended by QHY
-#if defined(__APPLE__)
-            OSXInitQHYCCDFirmwareArray();
-            // Wait a bit before calling GetDeviceIDs on MacOS
-            usleep(2000000);
-#endif
-
-            for (const auto &deviceId : GetDevicesIDs())
-            {
-                cameras.push_back(std::unique_ptr<QHYCCD>(new QHYCCD(deviceId.c_str())));
-            }
-        }
-
-        ~Loader()
-        {
-            ReleaseQHYCCDResource();
-        }
-
-    public:
-
-        // Scan for the available devices
-        std::vector<std::string> GetDevicesIDs()
-        {
-            char camid[MAXINDIDEVICE];
-            int deviceCount = 0;
-            std::vector<std::string> devices;
-
-#if defined(USE_SIMULATION)
-            deviceCount = 2;
-#else
-            deviceCount = ScanQHYCCD();
-#endif
-
-            for (int i = 0; i < deviceCount; i++)
-            {
-#if defined(USE_SIMULATION)
-                int ret = QHYCCD_SUCCESS;
-                snprintf(camid, MAXINDIDEVICE, "Model %d", i + 1);
-#else
-                int ret = GetQHYCCDId(i, camid);
-#endif
-                if (ret == QHYCCD_SUCCESS)
-                {
-                    devices.push_back(std::string(camid));
-                }
-                else
-                {
-                    IDLog("#%d GetQHYCCDId error (%d)\n", i, ret);
-                }
-            }
-
-            return devices;
+            hotPlugHandler = std::make_shared<QHYCCDHotPlugHandler>();
+            INDI::HotPlugManager::getInstance().registerHandler(hotPlugHandler);
+            INDI::HotPlugManager::getInstance().start(1000); // Start hot-plug checks every 1 second
         }
 } loader;
 
-QHYCCD::QHYCCD(const char *name) : FilterInterface(this)
+QHYCCD::QHYCCD(const char *name, const char *camID) : FilterInterface(this)
 {
     HasUSBTraffic = false;
     HasUSBSpeed   = false;
@@ -127,8 +59,15 @@ QHYCCD::QHYCCD(const char *name) : FilterInterface(this)
     HasFilters    = false;
 
     snprintf(this->m_Name, MAXINDINAME, "QHY CCD %.15s", name);
-    snprintf(this->m_CamID, MAXINDINAME, "%s", name);
-    setDeviceName(this->m_Name);
+    snprintf(this->m_CamID, MAXINDINAME, "%s", camID);
+
+    LOGF_INFO("*** This is the camera name: [%s]", m_Name);
+    LOGF_INFO("*** This is the camera ID: [%s]", m_CamID);
+
+    // Apply saved nickname from camera ID. Returns true if a nickname was found.
+    // If no nickname exists, fall back to the model-specific camera name.
+    if (!setDeviceNicknameFromId(m_CamID))
+        setDeviceName(this->m_Name);
 
     setVersion(INDI_QHY_VERSION_MAJOR, INDI_QHY_VERSION_MINOR);
 
@@ -206,6 +145,11 @@ bool QHYCCD::initProperties()
     IUFillNumber(&HumidityN[0], "HUMIDITY", "%", "%.2f", -100, 1000, 0.1, 0);
     IUFillNumberVector(&HumidityNP, HumidityN, 1, getDeviceName(), "CCD_HUMIDITY", "Humidity", MAIN_CONTROL_TAB,
                        IP_RO, 60, IPS_IDLE);
+
+    // CAA Rotator (angle in degrees, negative for reverse rotation)
+    IUFillNumber(&CAARotatorN[0], "CAA_ANGLE", "Angle (°)", "%.2f", -360, 360, 0.1, 0);
+    IUFillNumberVector(&CAARotatorNP, CAARotatorN, 1, getDeviceName(), "CAA_ROTATOR", "CAA Rotator", MAIN_CONTROL_TAB,
+                       IP_RW, 60, IPS_IDLE);
 
     // Cooler Mode
     IUFillSwitch(&CoolerModeS[COOLER_AUTOMATIC], "COOLER_AUTOMATIC", "Auto", ISS_ON);
@@ -320,6 +264,7 @@ bool QHYCCD::initProperties()
     IUFillTextVector(&GPSDataNowTP, GPSDataNowT, 4, getDeviceName(), "GPS_DATA_NOW", "Now", GPS_DATA_TAB, IP_RO, 60, IPS_IDLE);
 
     addAuxControls();
+    addNicknameControl();
     setDriverInterface(getDriverInterface());
 
     return true;
@@ -594,6 +539,29 @@ bool QHYCCD::updateProperties()
             defineProperty(&USBTrafficNP);
         }
 
+        if (HasCAA)
+        {
+            double min = 0, max = 0, step = 0;
+            if (!isSimulation())
+            {
+                int ret = GetQHYCCDParamMinMaxStep(m_CameraHandle, CONTROL_CAA_ROTATOR, &min, &max, &step);
+                if (ret == QHYCCD_SUCCESS)
+                {
+                    // Allow negative angle for reverse rotation
+                    CAARotatorN[0].min  = (min <= 0 ? min : -360);
+                    CAARotatorN[0].max  = max;
+                    CAARotatorN[0].step = (step > 0 ? step : 0.1);
+                }
+                CAARotatorN[0].value = GetQHYCCDParam(m_CameraHandle, CONTROL_CAA_ROTATOR);
+            }
+            defineProperty(&CAARotatorNP);
+            LOG_INFO("CAA Rotator: supported, control panel enabled");
+        }
+        else
+        {
+            LOG_INFO("CAA Rotator (control 95): not supported");
+        }
+
         defineProperty(&USBBufferNP);
 
         defineProperty(&SDKVersionTP);
@@ -674,6 +642,9 @@ bool QHYCCD::updateProperties()
 
         if (HasUSBTraffic)
             deleteProperty(USBTrafficNP.name);
+
+        if (HasCAA)
+            deleteProperty(CAARotatorNP.name);
 
         deleteProperty(USBBufferNP.name);
 
@@ -1101,6 +1072,17 @@ bool QHYCCD::Connect()
         }
 
         LOGF_INFO("Humidity Support: %s", HasHumidity ? "True" : "False");
+
+        ////////////////////////////////////////////////////////////////////
+        /// CAA Rotator Support (CONTROL_CAA_ROTATOR = 95)
+        ////////////////////////////////////////////////////////////////////
+        ret = IsQHYCCDControlAvailable(m_CameraHandle, CONTROL_CAA_ROTATOR);
+        if (ret == QHYCCD_SUCCESS)
+        {
+            HasCAA = true;
+        }
+        LOGF_INFO("CAA Rotator (control 95): %s (SDK result=%u)", HasCAA ? "supported" : "not supported", ret);
+
         ////////////////////////////////////////////////////////////////////
         /// Overscan Area Support
         ////////////////////////////////////////////////////////////////////
@@ -2034,6 +2016,30 @@ bool QHYCCD::ISNewNumber(const char *dev, const char *name, double values[], cha
         }
 
         //////////////////////////////////////////////////////////////////////
+        /// CAA Rotator Control (angle in degrees, negative = reverse)
+        //////////////////////////////////////////////////////////////////////
+        else if (!strcmp(name, CAARotatorNP.name))
+        {
+            double currentAngle = CAARotatorN[0].value;
+            IUUpdateNumber(&CAARotatorNP, values, names, n);
+            int rc = SetQHYCCDParam(m_CameraHandle, CONTROL_CAA_ROTATOR, CAARotatorN[0].value);
+            if (rc == QHYCCD_SUCCESS)
+            {
+                CAARotatorNP.s = IPS_OK;
+                saveConfig(true, CAARotatorNP.name);
+                LOGF_INFO("CAA Rotator angle set to %.2f°", CAARotatorN[0].value);
+            }
+            else
+            {
+                CAARotatorNP.s = IPS_ALERT;
+                CAARotatorN[0].value = currentAngle;
+                LOGF_ERROR("Failed to set CAA Rotator angle: %d", rc);
+            }
+            IDSetNumber(&CAARotatorNP, nullptr);
+            return true;
+        }
+
+        //////////////////////////////////////////////////////////////////////
         /// USB Buffer Control
         //////////////////////////////////////////////////////////////////////
         else if (!strcmp(name, USBBufferNP.name))
@@ -2350,8 +2356,14 @@ bool QHYCCD::saveConfigItems(FILE *fp)
     if (HasUSBTraffic)
         IUSaveConfigNumber(fp, &USBTrafficNP);
 
+    if (HasCAA)
+        IUSaveConfigNumber(fp, &CAARotatorNP);
+
     if (HasAmpGlow)
         IUSaveConfigSwitch(fp, &AMPGlowSP);
+
+    if (HasOverscanArea)
+        IUSaveConfigSwitch(fp, &OverscanAreaSP);
 
     if (HasGPS)
     {
@@ -2678,6 +2690,11 @@ void QHYCCD::exposureSetRequest(ImageState request)
 void QHYCCD::logQHYMessages(const std::string &message)
 {
     LOGF_DEBUG("%s", message.c_str());
+}
+
+void QHYCCD::nicknameSet(const char *nickname)
+{
+    saveNicknameId(nickname, m_CamID);
 }
 
 void QHYCCD::debugTriggered(bool enable)
